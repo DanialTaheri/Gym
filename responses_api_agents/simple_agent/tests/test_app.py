@@ -334,3 +334,111 @@ class TestApp:
             "safety_identifier": None,
         }
         assert expected_responses_dict == actual_responses_dict
+
+    async def test_responses_handles_context_length_exceeded_without_usage_crash(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        config = SimpleAgentConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="",
+            model_server=ModelServerRef(
+                type="responses_api_models",
+                name="my server name",
+            ),
+            resources_server=ResourcesServerRef(
+                type="resources_servers",
+                name="my resources server",
+            ),
+        )
+        server = SimpleAgent(config=config, server_client=MagicMock(spec=ServerClient))
+        app = server.setup_webserver()
+        client = TestClient(app)
+
+        first_model_response_data = {
+            "id": "resp_first",
+            "created_at": 1753983920.0,
+            "model": "dummy_model",
+            "object": "response",
+            "output": [
+                {
+                    "arguments": '{"city":"San Francisco"}',
+                    "call_id": "call_123",
+                    "name": "get_weather",
+                    "type": "function_call",
+                    "id": "call_123",
+                    "status": "completed",
+                }
+            ],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+            "usage": {
+                "input_tokens": 5,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 2,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 7,
+            },
+        }
+        overflow_model_response_data = {
+            "id": "resp_overflow",
+            "created_at": 1753983921.0,
+            "model": "dummy_model",
+            "object": "response",
+            "output": [
+                {
+                    "id": "msg_overflow",
+                    "content": [
+                        {
+                            "annotations": [],
+                            "text": "",
+                            "type": "output_text",
+                        }
+                    ],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                    "prompt_token_ids": [11, 12, 13, 14],
+                    "generation_token_ids": [],
+                    "generation_log_probs": [],
+                }
+            ],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+            "metadata": {"context_length_exceeded": "true"},
+            "usage": None,
+        }
+
+        first_model_response = AsyncMock()
+        first_model_response.read.return_value = json.dumps(first_model_response_data)
+        first_model_response.cookies = MagicMock()
+
+        tool_response = AsyncMock()
+        tool_response.cookies = MagicMock()
+        tool_response.content.read.return_value = b'{"temperature": 65}'
+
+        overflow_model_response = AsyncMock()
+        overflow_model_response.read.return_value = json.dumps(
+            overflow_model_response_data
+        )
+        overflow_model_response.cookies = MagicMock()
+
+        server.server_client.post.side_effect = [
+            first_model_response,
+            tool_response,
+            overflow_model_response,
+        ]
+
+        response = client.post(
+            "/v1/responses",
+            json={"input": [{"role": "user", "content": "hello"}]},
+        )
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["metadata"] == {"context_length_exceeded": "true"}
+        assert data["usage"]["total_tokens"] == 7
+        assert data["output"][-1]["generation_token_ids"] == []

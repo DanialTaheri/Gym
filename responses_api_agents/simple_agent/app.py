@@ -105,9 +105,12 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             new_outputs.extend(output)
 
             if not usage:
-                usage = model_response.usage
-
-            if usage:
+                usage = (
+                    model_response.usage.model_copy(deep=True)
+                    if model_response.usage
+                    else None
+                )
+            elif model_response.usage:
                 usage.input_tokens += model_response.usage.input_tokens
                 usage.output_tokens += model_response.usage.output_tokens
                 usage.total_tokens += model_response.usage.total_tokens
@@ -115,6 +118,10 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 # TODO support more advanced token details
                 usage.input_tokens_details.cached_tokens = 0
                 usage.output_tokens_details.reasoning_tokens = 0
+
+            metadata = model_response.metadata or {}
+            if metadata.get("context_length_exceeded") == "true":
+                break
 
             if model_response.incomplete_details and model_response.incomplete_details.reason == "max_output_tokens":
                 break
