@@ -326,11 +326,20 @@ class NeMoGymChatCompletionMessageForTraining(NeMoGymChatCompletionMessage, Toke
 
 
 class NeMoGymChoice(Choice):
+    finish_reason: Literal[
+        "stop",
+        "length",
+        "tool_calls",
+        "content_filter",
+        "function_call",
+        "context_length_exceeded",
+    ]
     message: Union[NeMoGymChatCompletionMessage, NeMoGymChatCompletionMessageForTraining]
 
 
 class NeMoGymChatCompletion(ChatCompletion):
     choices: List[NeMoGymChoice]
+    context_length_exceeded: Optional[bool] = None
 
 
 ########################################
