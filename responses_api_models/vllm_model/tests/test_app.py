@@ -801,6 +801,96 @@ class TestApp:
         assert response.json()["id"] == "chtcmpl-clamped"
         assert mock_client.create_chat_completion.await_args.kwargs["max_tokens"] == 2
 
+    def test_responses_return_token_id_information_uses_native_vllm_token_ids(
+        self,
+        monkeypatch: MonkeyPatch,
+    ):
+        config = VLLMModelConfig(
+            host="0.0.0.0",
+            port=8081,
+            base_url="http://api.openai.com/v1",
+            api_key="dummy_key",  # pragma: allowlist secret
+            model="dummy_model",
+            entrypoint="",
+            name="",
+            return_token_id_information=True,
+            uses_reasoning_parser=False,
+        )
+        server = VLLMModel(config=config, server_client=MagicMock(spec=ServerClient))
+        app = server.setup_webserver()
+
+        captured_kwargs = {}
+
+        async def mock_create_chat_completion(**kwargs):
+            captured_kwargs.update(kwargs)
+            return {
+                "id": "chtcmpl",
+                "object": "chat.completion",
+                "created": FIXED_TIME,
+                "model": "dummy_model",
+                "prompt_token_ids": [1, 2, 3],
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "response",
+                            "tool_calls": [],
+                        },
+                        "token_ids": [41, 42],
+                        "logprobs": {
+                            "content": [
+                                {
+                                    "token": "token_id:999",
+                                    "logprob": -0.1,
+                                    "bytes": [],
+                                },
+                                {
+                                    "token": "token_id:998",
+                                    "logprob": -0.2,
+                                    "bytes": [],
+                                },
+                            ]
+                        },
+                    }
+                ],
+            }
+
+        mock_client = MagicMock(spec=NeMoGymAsyncOpenAI)
+        mock_client.create_chat_completion = AsyncMock(
+            side_effect=mock_create_chat_completion
+        )
+        mock_client.create_tokenize = AsyncMock()
+        server._clients = [mock_client]
+
+        client = TestClient(app)
+        request_body = NeMoGymResponseCreateParamsNonStreaming(
+            input=[
+                NeMoGymEasyInputMessage(
+                    type="message",
+                    role="user",
+                    content="hello",
+                )
+            ],
+        )
+
+        response = client.post(
+            "/v1/responses",
+            json=request_body.model_dump(exclude_unset=True, mode="json"),
+        )
+
+        assert response.status_code == 200
+        assert captured_kwargs["logprobs"] is True
+        assert captured_kwargs["return_tokens_as_token_ids"] is True
+        assert captured_kwargs["return_token_ids"] is True
+        mock_client.create_tokenize.assert_not_awaited()
+
+        output_item = response.json()["output"][0]
+        assert output_item["prompt_token_ids"] == [1, 2, 3]
+        assert output_item["generation_token_ids"] == [41, 42]
+        assert output_item["generation_log_probs"] == [-0.1, -0.2]
+
     def test_responses_multistep(self, monkeypatch: MonkeyPatch):
         server = self._setup_server(monkeypatch)
         app = server.setup_webserver()
