@@ -467,24 +467,69 @@ class VLLMModel(SimpleResponsesAPIModel):
             log_probs = choice_dict["logprobs"]["content"]
             generation_log_probs = [log_prob["logprob"] for log_prob in log_probs]
 
-            """
-            START TODO remove this when NeMo RL upgrades to vLLM 0.10.2 support for prompt token ids
-            """
-            # Looks like `"token_id:151667"`
-            generation_token_ids = [log_prob["token"].removeprefix("token_id:") for log_prob in log_probs]
-            """
-            END
-            """
-            if prompt_token_ids is None:
+            def _token_id_from_logprob_token(token: Any) -> int:
+                if isinstance(token, str) and token.startswith("token_id:"):
+                    return int(token.removeprefix("token_id:"))
+                raise ValueError(
+                    "Cannot recover a token id from logprobs.content token "
+                    f"{token!r}. Expected vLLM return_tokens_as_token_ids=True "
+                    "format like 'token_id:151667'."
+                )
+
+            direct_generation_token_ids = choice_dict.get("token_ids")
+            if direct_generation_token_ids is not None:
+                generation_token_ids = [
+                    int(token_id) for token_id in direct_generation_token_ids
+                ]
+                try:
+                    logprob_token_ids = [
+                        _token_id_from_logprob_token(log_prob["token"])
+                        for log_prob in log_probs
+                    ]
+                except ValueError:
+                    logprob_token_ids = None
+                if (
+                    logprob_token_ids is not None
+                    and logprob_token_ids != generation_token_ids
+                ):
+                    mismatch_positions = [
+                        idx
+                        for idx, (direct_token_id, logprob_token_id) in enumerate(
+                            zip(generation_token_ids, logprob_token_ids)
+                        )
+                        if direct_token_id != logprob_token_id
+                    ]
+                    LOGGER.warning(
+                        "vLLM native token_ids differ from logprobs token "
+                        "strings at %d/%d positions; using native token_ids. "
+                        "First mismatches: %s",
+                        len(mismatch_positions),
+                        len(generation_token_ids),
+                        mismatch_positions[:10],
+                    )
+            else:
+                generation_token_ids = [
+                    _token_id_from_logprob_token(log_prob["token"])
+                    for log_prob in log_probs
+                ]
+
+            if len(generation_token_ids) != len(generation_log_probs):
+                raise ValueError(
+                    "vLLM returned mismatched generation token/logprob lengths: "
+                    f"len(generation_token_ids)={len(generation_token_ids)}, "
+                    f"len(generation_log_probs)={len(generation_log_probs)}"
+                )
+
+            native_prompt_token_ids = chat_completion_dict.get("prompt_token_ids")
+            if native_prompt_token_ids is not None:
+                prompt_token_ids = [int(token_id) for token_id in native_prompt_token_ids]
+            elif prompt_token_ids is None:
                 prompt_token_ids = await self._get_prompt_token_ids(client, body_dict)
 
             message_dict = choice_dict["message"]
             message_dict.update(
                 dict(
-                    # TODO add this when NeMo RL upgrades to vLLM 0.10.2 support for prompt token ids
-                    # prompt_token_ids=chat_completion_dict["prompt_token_ids"],
                     prompt_token_ids=prompt_token_ids,
-                    # generation_token_ids=choice_dict["token_ids"],
                     generation_token_ids=generation_token_ids,
                     generation_log_probs=generation_log_probs,
                 )
@@ -492,9 +537,8 @@ class VLLMModel(SimpleResponsesAPIModel):
 
             # Clean the duplicated information
             choice_dict.pop("logprobs")
-            # TODO add this when NeMo RL upgrades to vLLM 0.10.2 support for prompt token ids
-            # chat_completion_dict.pop("prompt_token_ids")
-            # choice_dict.pop("token_ids")
+            chat_completion_dict.pop("prompt_token_ids", None)
+            choice_dict.pop("token_ids", None)
 
         return NeMoGymChatCompletion.model_validate(chat_completion_dict)
 
