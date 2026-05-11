@@ -756,7 +756,11 @@ class TestApp:
             name="",
             return_token_id_information=False,
             uses_reasoning_parser=False,
-            max_input_tokens=5,
+            max_input_tokens=10,
+            extra_body={
+                "bad_words": ["<image>"],
+                "mm_processor_kwargs": {"precomputed_imgs_sizes": [[128, 256]]},
+            },
         )
         get_global_config_dict_mock = MagicMock()
         get_global_config_dict_mock.return_value = dict()
@@ -770,7 +774,10 @@ class TestApp:
         client = TestClient(app)
 
         mock_client = AsyncMock(spec=NeMoGymAsyncOpenAI)
-        mock_client.create_tokenize.return_value = {"tokens": [11, 12, 13]}
+        mock_client.create_tokenize.return_value = {
+            "tokens": [11, 12, 13],
+            "max_model_len": 5,
+        }
         mock_client.create_chat_completion.return_value = {
             "id": "chtcmpl-clamped",
             "object": "chat.completion",
@@ -799,6 +806,10 @@ class TestApp:
         )
         assert response.status_code == 200
         assert response.json()["id"] == "chtcmpl-clamped"
+        assert mock_client.create_tokenize.await_args.kwargs["mm_processor_kwargs"] == {
+            "precomputed_imgs_sizes": [[128, 256]]
+        }
+        assert "bad_words" not in mock_client.create_tokenize.await_args.kwargs
         assert mock_client.create_chat_completion.await_args.kwargs["max_tokens"] == 2
 
     def test_responses_return_token_id_information_uses_native_vllm_token_ids(
