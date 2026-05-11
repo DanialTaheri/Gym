@@ -274,7 +274,6 @@ class NeMoGymResponseCreateParamsNonStreaming(BaseModel):
     truncation: Optional[Literal["auto", "disabled"]] = None
     user: Optional[str] = None
     stream: Optional[Literal[False]] = None
-    bad_words: Optional[List[str]] = None
 
 
 ########################################
@@ -457,7 +456,6 @@ class NeMoGymChatCompletionCreateParamsNonStreaming(BaseModel):
     user: Optional[str] = None
     web_search_options: Optional[WebSearchOptions] = None
     stream: Optional[Literal[False]] = None
-    bad_words: Optional[List[str]] = None
 
     # Disallow deprecated args
     # function_call: FunctionCall
