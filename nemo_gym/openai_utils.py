@@ -110,6 +110,12 @@ class TokenIDLogProbMixin(BaseModel):
     finish_reason: Optional[str] = None
     debug_vllm_generation_top_logprobs: Optional[List[List[dict]]] = None
     debug_vllm_generation_top_logprobs_status: Optional[str] = None
+    # Multimodal content introduced since the previous trainable model call.
+    # Agent harnesses that add images between turns (for example SpatialClaw's
+    # show() feedback) return it with the token metadata so NeMo RL can rebuild
+    # the policy-side pixel tensors for the exact prompt seen by vLLM.
+    prompt_multimodal_content: Optional[List[Dict[str, Any]]] = None
+    prompt_mm_processor_kwargs: Optional[Dict[str, Any]] = None
 
 
 class TokenIDLogProbTypedDictMixin(TypedDict):
@@ -123,6 +129,8 @@ class TokenIDLogProbTypedDictMixin(TypedDict):
     native_logprob_token_id_first_mismatches: NotRequired[List[int]]
     finish_reason: NotRequired[str]
     debug_vllm_generation_top_logprobs: NotRequired[List[List[dict]]]
+    prompt_multimodal_content: NotRequired[List[Dict[str, Any]]]
+    prompt_mm_processor_kwargs: NotRequired[Dict[str, Any]]
     debug_vllm_generation_top_logprobs_status: NotRequired[str]
 
 
@@ -465,6 +473,11 @@ class NeMoGymChatCompletionAssistantMessageParam(ChatCompletionAssistantMessageP
     # Override the iterable which is annoying to work with.
     content: Union[str, List[ContentArrayOfContentPart], None]
     tool_calls: Optional[List[NeMoGymChatCompletionMessageToolCallParam]] = None
+    # vLLM uses these fields to reconstruct prior thinking tokens when
+    # truncate_history_thinking is disabled. Keep both spellings across the
+    # pre/post-v0.16 API transition.
+    reasoning_content: Optional[str]
+    reasoning: Optional[str]
 
 
 class NeMoGymChatCompletionAssistantMessageForTrainingParam(
@@ -486,12 +499,14 @@ NeMoGymChatCompletionMessageParam: TypeAlias = Union[
     NeMoGymChatCompletionDeveloperMessageParam,
     NeMoGymChatCompletionSystemMessageParam,
     NeMoGymChatCompletionUserMessageParam,
+    # Put the more specific training variant first.  Both assistant variants
+    # use role="assistant"; selecting the ordinary one first can discard the
+    # token metadata needed to reconstruct an exact multi-turn RL prefix.
+    NeMoGymChatCompletionAssistantMessageForTrainingParam,
     NeMoGymChatCompletionAssistantMessageParam,
     NeMoGymChatCompletionToolMessageParam,
     # Don't add deprecated.
     # NeMoGymChatCompletionFunctionMessageParam,
-    # Training:
-    NeMoGymChatCompletionAssistantMessageForTrainingParam,
 ]
 
 
@@ -525,6 +540,27 @@ class NeMoGymChatCompletionCreateParamsNonStreaming(BaseModel):
     user: Optional[str] = None
     web_search_options: Optional[WebSearchOptions] = None
     stream: Optional[Literal[False]] = None
+
+    # vLLM request extensions accepted through OpenAI client's `extra_body`.
+    # Agentic harnesses need chat_template_kwargs on every turn to preserve
+    # prior thinking, and multimodal harnesses may set processor overrides.
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
+    mm_processor_kwargs: Optional[Dict[str, Any]] = None
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    skip_special_tokens: Optional[bool] = None
+    thinking_token_budget: Optional[int] = None
+    reasoning_budget: Optional[int] = None
+    # Exact sampled prefix used by NeMo RL's vLLM serving extension.  Keeping
+    # this top-level escape hatch is important for agent harnesses that pass
+    # through an intermediate OpenAI-compatible server: TypedDict unions may
+    # otherwise normalize away token metadata attached to prior messages.
+    required_prefix_token_ids: Optional[List[int]] = None
+    # Number of leading chat messages represented by
+    # ``required_prefix_token_ids``.  This avoids inferring the prefix boundary
+    # after OpenAI-compatible schemas normalize message roles and fields.
+    required_prefix_message_count: Optional[int] = None
 
     # Disallow deprecated args
     # function_call: FunctionCall

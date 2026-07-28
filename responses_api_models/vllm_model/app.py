@@ -198,7 +198,10 @@ class VLLMModel(SimpleResponsesAPIModel):
             choices=[
                 NeMoGymChoice(
                     index=0,
-                    finish_reason="context_length_exceeded",
+                    # Keep the OpenAI-compatible finish-reason enum valid.
+                    # The more specific condition is carried by the top-level
+                    # ``context_length_exceeded`` extension below.
+                    finish_reason="length",
                     message=message,
                 )
             ],
@@ -218,6 +221,13 @@ class VLLMModel(SimpleResponsesAPIModel):
             "tools",
             "chat_template_kwargs",
             "mm_processor_kwargs",
+            # Exact-history agent harnesses replace the re-rendered prefix
+            # with the tokens sampled on earlier policy calls.  The tokenize
+            # endpoint implements the same replacement, so forward both
+            # fields here; otherwise context preflight under-counts later
+            # turns and cannot clamp max_tokens to the real remaining window.
+            "required_prefix_token_ids",
+            "required_prefix_message_count",
         ):
             if key in body_dict:
                 tokenize_body_dict[key] = body_dict[key]
@@ -272,6 +282,11 @@ class VLLMModel(SimpleResponsesAPIModel):
         elif choice.finish_reason == "content_filter":
             incomplete_details = {"reason": "content_filter"}
 
+        response_metadata = body.metadata
+        if getattr(chat_completion_response, "context_length_exceeded", False):
+            response_metadata = dict(response_metadata or {})
+            response_metadata["context_length_exceeded"] = "true"
+
         # Chat Completion -> Response
         return NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
@@ -294,7 +309,7 @@ class VLLMModel(SimpleResponsesAPIModel):
             text=body.text,
             top_logprobs=body.top_logprobs,
             truncation=body.truncation,
-            metadata=body.metadata,
+            metadata=response_metadata,
             instructions=body.instructions,
             user=body.user,
             incomplete_details=incomplete_details,
@@ -355,6 +370,16 @@ class VLLMModel(SimpleResponsesAPIModel):
         chat_template_kwargs = {}
         if self.config.chat_template_kwargs:
             chat_template_kwargs = deepcopy(self.config.chat_template_kwargs)
+
+        # OpenAI clients send vLLM extensions supplied through `extra_body` as
+        # top-level request keys. Preserve those per-call overrides (notably
+        # truncate_history_thinking=false for multi-turn RL harnesses) instead
+        # of replacing them with only the server defaults.
+        direct_chat_template_kwargs = body_dict.get("chat_template_kwargs")
+        if direct_chat_template_kwargs:
+            if not isinstance(direct_chat_template_kwargs, dict):
+                raise TypeError("chat_template_kwargs must be a dict")
+            chat_template_kwargs.update(deepcopy(direct_chat_template_kwargs))
 
         metadata = body_dict.get("metadata") or dict()
         if isinstance(metadata, BaseModel):
@@ -462,6 +487,15 @@ class VLLMModel(SimpleResponsesAPIModel):
         self, request: Request, body: NeMoGymChatCompletionCreateParamsNonStreaming = Body()
     ) -> NeMoGymChatCompletion:
         body_dict = body.model_dump(exclude_unset=True)
+        required_prefix = body_dict.get("required_prefix_token_ids") or []
+        if required_prefix:
+            print(
+                "[VLLM_PREFIX_FORWARD] "
+                f"required_prefix_token_ids={len(required_prefix)} "
+                "required_prefix_message_count="
+                f"{body_dict.get('required_prefix_message_count')}",
+                flush=True,
+            )
         body_dict = self._preprocess_chat_completion_create_params(request, body_dict)
 
         client = self._resolve_client(request)

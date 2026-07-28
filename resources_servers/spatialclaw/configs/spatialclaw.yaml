@@ -1,0 +1,6 @@
+spatialclaw_resources:
+  resources_servers:
+    spatialclaw:
+      entrypoint: app.py
+      domain: agent
+      spatialclaw_root: ${oc.env:SPATIALCLAW_ROOT}
