@@ -95,9 +95,9 @@ class TestApp:
         server_client_post_mock.assert_called_once_with(
             server_name="model_server",
             url_path="/v1/responses",
-            json=NeMoGymResponseCreateParamsNonStreaming(
-                input=[],
-            ),
+            json={
+                "input": [],
+            },
         )
 
         chat_response_object = {
@@ -188,14 +188,59 @@ class TestApp:
         server_client_post_mock.assert_called_once_with(
             server_name="model_server",
             url_path="/v1/responses",
-            json=NeMoGymResponseCreateParamsNonStreaming(
-                input=[
-                    NeMoGymEasyInputMessage(
-                        role="user",
-                        content="I'd like to ask a question.",
-                    )
+            json={
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": "I'd like to ask a question.",
+                    }
                 ],
-            ),
+            },
+        )
+
+    async def test_responses_preserves_nonempty_tool_fields(
+        self, agent_config: ToolSimulationAgentConfig
+    ) -> None:
+        server_client_post_mock = AsyncMock()
+        server_client_mock = MagicMock(spec=ServerClient)
+        server_client_mock.post = server_client_post_mock
+        agent_server = ToolSimulationAgent(
+            config=agent_config,
+            server_client=server_client_mock,
+        )
+        test_client = TestClient(agent_server.setup_webserver())
+        tools = [
+            {
+                "name": "acknowledge",
+                "parameters": None,
+                "strict": None,
+                "type": "function",
+                "description": None,
+            }
+        ]
+
+        self._set_server_client_post_responses(
+            server_client_post_mock,
+            {"id": "missing_created_at"},
+        )
+        with raises(RuntimeError, match="Received an invalid response from the model server: "):
+            test_client.post(
+                "/v1/responses",
+                json={"input": [], "tools": tools},
+            )
+
+        server_client_post_mock.assert_called_once_with(
+            server_name="model_server",
+            url_path="/v1/responses",
+            json={
+                "input": [],
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                # Pydantic drops optional null members while retaining the
+                # complete nonempty tool selection sent to the model server.
+                "tools": [{"name": "acknowledge", "type": "function"}],
+            },
         )
 
     async def test_run(self, agent_config: ToolSimulationAgentConfig) -> None:

@@ -1,14 +1,18 @@
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from responses_api_agents.spatialclaw_agent import rl_adapter
 from responses_api_agents.spatialclaw_agent.rl_adapter import (
     _ACTIVE_MAIN_SESSION,
+    _SESSIONS,
     CapturedTurn,
     CaptureSession,
     _CompletionsProxy,
     _preserving_state_messages_to_openai,
     _replace_key_frames_with_videos,
+    _rl_llm_step_node,
     instrument_llm_client,
 )
 
@@ -79,6 +83,12 @@ def test_capture_keeps_exact_turn_tokens_and_only_new_prompt_media():
     assert session.turns[1].prompt_token_ids == [1, 2, 3, 4]
     assert session.turns[1].generation_token_ids == [5, 6]
     assert session.turns[1].generation_log_probs == [-0.2, -0.3]
+    assert session.turns[1].request_kwargs["messages"] == second_messages
+    assert session.turns[1].request_kwargs["extra_body"]["required_prefix_token_ids"] == [
+        1,
+        2,
+        3,
+    ]
 
 
 def test_capture_rejects_token_logprob_mismatch():
@@ -210,6 +220,7 @@ async def test_video_aware_main_call_captures_source_video_not_key_frames():
     assert completions.calls[1]["extra_body"]["mm_processor_kwargs"] == {
         "video_as_images": True,
         "video_as_images_frame_counts": [1],
+        "video_as_images_group_types": ["image"],
     }
 
 
@@ -269,7 +280,8 @@ async def test_keyframe_main_call_preserves_multiturn_video_frame_groups():
 
     assert completions.kwargs["extra_body"]["mm_processor_kwargs"] == {
         "video_as_images": True,
-        "video_as_images_frame_counts": [32, 17, 1],
+        "video_as_images_frame_counts": [32, *([1] * 18)],
+        "video_as_images_group_types": ["video", *(["image"] * 18)],
     }
 
 
@@ -444,4 +456,59 @@ async def test_context_exceeded_main_call_is_not_captured_as_training():
         _ACTIVE_MAIN_SESSION.reset(token)
 
     assert returned is response
+    assert session.turns == []
+    assert session.terminal_failure_reason == "context_length_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_context_exceeded_routes_to_official_force_termination(monkeypatch):
+    class AIMessage:
+        def __init__(self, content):
+            self.content = content
+
+    class HumanMessage:
+        def __init__(self, content):
+            self.content = content
+
+    messages_module = ModuleType("langchain_core.messages")
+    messages_module.AIMessage = AIMessage
+    messages_module.HumanMessage = HumanMessage
+    langchain_module = ModuleType("langchain_core")
+    langchain_module.messages = messages_module
+    monkeypatch.setitem(sys.modules, "langchain_core", langchain_module)
+    monkeypatch.setitem(sys.modules, "langchain_core.messages", messages_module)
+
+    session = CaptureSession("session")
+
+    async def original_llm_step_node(state, config):
+        active_session = _ACTIVE_MAIN_SESSION.get()
+        assert active_session is session
+        active_session.terminal_failure_reason = "context_length_exceeded"
+        return {
+            "messages": [AIMessage(content="maximum context length exceeded")],
+            "current_llm_response": "must not execute",
+            "failure_count": state["failure_count"] + 1,
+            "last_error_type": "validation_failed",
+        }
+
+    monkeypatch.setattr(rl_adapter, "_ORIGINAL_LLM_STEP_NODE", original_llm_step_node)
+    _SESSIONS[session.session_id] = session
+    try:
+        result = await _rl_llm_step_node(
+            {
+                "session_id": session.session_id,
+                "failure_count": 0,
+                "max_failures": 30,
+            },
+            {"configurable": {}},
+        )
+    finally:
+        _SESSIONS.pop(session.session_id, None)
+
+    assert result["failure_count"] == 30
+    assert result["last_error_type"] == "context_length_exceeded"
+    assert result["current_llm_response"] is None
+    assert len(result["messages"]) == 1
+    assert isinstance(result["messages"][0], HumanMessage)
+    assert "maximum context length exceeded" in result["messages"][0].content
     assert session.turns == []

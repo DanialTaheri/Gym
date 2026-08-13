@@ -335,6 +335,12 @@ class NeMoGymResponseCreateParamsNonStreaming(BaseModel):
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePromptParam] = None
     reasoning: Optional[Reasoning] = None
+    # vLLM's Responses API accepts ``seed`` even though it is not part of the
+    # public OpenAI Responses schema.  Gym's rollout profiler deliberately
+    # materializes a distinct seed for every repeated sample; retaining it in
+    # the validated request makes those repeats reproducible instead of
+    # rejecting them before they reach the model server.
+    seed: Optional[int] = None
     service_tier: Optional[Literal["auto", "default", "flex", "scale", "priority"]] = None
     store: Optional[bool] = None
     temperature: Optional[float] = None

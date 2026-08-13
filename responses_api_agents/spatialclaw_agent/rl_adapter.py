@@ -74,17 +74,21 @@ def _media_from_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return media
 
 
-def _video_as_images_frame_counts(messages: list[dict[str, Any]]) -> list[int]:
-    """Return image counts at the message boundaries seen by the main policy.
+def _video_as_images_frame_groups(
+    messages: list[dict[str, Any]], *, video_input_mode: str
+) -> tuple[list[int], list[str]]:
+    """Return media groups at the message boundaries seen by the main policy.
 
     vLLM otherwise flattens every ``image_url`` in a multi-turn request into
     one synthetic video.  SpatialClaw introduces visual observations between
     sampled assistant turns, so that flattening changes the Conv3D grouping of
-    historical frames on later requests.  Carry the original message groups to
-    the model server so every turn and policy replay use the same temporal
-    boundaries.
+    historical frames on later requests.  Only the initial key-frame overview
+    is a video group.  Images returned by ``show``, crop, SAM3, or Reconstruct
+    are ordinary image observations, matching the SpatialClaw SFT history.
     """
     frame_counts: list[int] = []
+    group_types: list[str] = []
+    initial_keyframe_group_seen = False
     for raw_message in messages:
         message = (
             raw_message.model_dump(exclude_none=True)
@@ -102,9 +106,20 @@ def _video_as_images_frame_counts(messages: list[dict[str, Any]]) -> list[int]:
             if isinstance(part, dict)
             and part.get("type") in {"image", "image_url", "input_image"}
         )
-        if count:
+        if not count:
+            continue
+
+        if video_input_mode == "key-frame-aware" and not initial_keyframe_group_seen:
             frame_counts.append(count)
-    return frame_counts
+            group_types.append("video")
+            initial_keyframe_group_seen = True
+            continue
+
+        # Later visual observations are independent images.  The mixed-media
+        # vLLM contract requires one count entry per ordinary image group.
+        frame_counts.extend([1] * count)
+        group_types.extend(["image"] * count)
+    return frame_counts, group_types
 
 
 def _video_url(value: str) -> str:
@@ -191,6 +206,7 @@ class CapturedTurn:
     request_required_prefix_message_count: int = 0
     request_message_prefix_length: int = 0
     finish_reason: str | None = None
+    request_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def validate(self, turn_index: int) -> None:
         if not self.prompt_token_ids:
@@ -215,6 +231,7 @@ class CaptureSession:
     source_videos: list[str] = field(default_factory=list)
     turns: list[CapturedTurn] = field(default_factory=list)
     previous_prompt_messages: list[dict[str, Any]] = field(default_factory=list)
+    terminal_failure_reason: str | None = None
 
     def capture(self, request_kwargs: dict[str, Any], response: Any) -> None:
         messages = copy.deepcopy(request_kwargs.get("messages") or [])
@@ -289,6 +306,21 @@ class CaptureSession:
                 request_required_prefix_message_count=int(extra_body.get("required_prefix_message_count") or 0),
                 request_message_prefix_length=message_prefix_length,
                 finish_reason=_field(choice, "finish_reason"),
+                request_kwargs={
+                    key: copy.deepcopy(value)
+                    for key, value in request_kwargs.items()
+                    if key
+                    in {
+                        "messages",
+                        "model",
+                        "tools",
+                        "tool_choice",
+                        "temperature",
+                        "top_p",
+                        "max_tokens",
+                        "extra_body",
+                    }
+                },
             )
         )
 
@@ -349,12 +381,16 @@ class _CompletionsProxy:
                 extra_body.get("mm_processor_kwargs") or {}
             )
             if mm_processor_kwargs.get("video_as_images"):
-                frame_counts = _video_as_images_frame_counts(messages)
+                frame_counts, group_types = _video_as_images_frame_groups(
+                    messages,
+                    video_input_mode=session.video_input_mode,
+                )
                 if frame_counts:
                     kwargs = dict(kwargs)
                     mm_processor_kwargs["video_as_images_frame_counts"] = (
                         frame_counts
                     )
+                    mm_processor_kwargs["video_as_images_group_types"] = group_types
                     extra_body["mm_processor_kwargs"] = mm_processor_kwargs
                     kwargs["extra_body"] = extra_body
         else:
@@ -406,8 +442,11 @@ class _CompletionsProxy:
             if _field(response, "context_length_exceeded", False):
                 # No model generation occurred.  Do not turn an over-length
                 # attempted prompt into a trainable turn: _rl_llm_step_node
-                # will retain it as environment feedback while the last exact
-                # sampled prefix remains untouched.
+                # will retain it as environment feedback, preserve the last
+                # exact sampled prefix, and route directly to SpatialClaw's
+                # standard force-termination fallback. Retrying the same
+                # over-length history can never make the prompt shorter.
+                session.terminal_failure_reason = "context_length_exceeded"
                 print(
                     "[spatialclaw_llm] kind=main capture=skipped_context_length_exceeded",
                     file=sys.stderr,
@@ -490,6 +529,7 @@ async def _rl_llm_step_node(state, config):
         )
     if llm_client is not None:
         llm_client._nemo_gym_required_prefix_token_ids = required_prefix
+    session.terminal_failure_reason = None
     token = _ACTIVE_MAIN_SESSION.set(session)
     try:
         result = await _ORIGINAL_LLM_STEP_NODE(state, config)
@@ -499,6 +539,30 @@ async def _rl_llm_step_node(state, config):
             llm_client._nemo_gym_required_prefix_token_ids = previous_required_prefix
 
     messages = list(result.get("messages") or [])
+    if session.terminal_failure_reason is not None:
+        # Context exhaustion is terminal for this immutable conversation: the
+        # next retry would submit the same prefix plus more error feedback.
+        # Preserve the failed attempt as environment context, but do not invent
+        # policy tokens, drop the sample, or alter its reward. Hitting the
+        # harness failure budget routes to SpatialClaw's official
+        # force_terminate node on the next graph edge.
+        result["messages"] = [
+            HumanMessage(content=f"[Policy call failed] {getattr(message, 'content', message)}")
+            if isinstance(message, AIMessage)
+            else message
+            for message in messages
+        ]
+        result["current_llm_response"] = None
+        result["failure_count"] = int(state["max_failures"])
+        result["last_error_type"] = session.terminal_failure_reason
+        print(
+            "[spatialclaw_llm] kind=main route=force_terminate "
+            f"reason={session.terminal_failure_reason} captured_turns={len(session.turns)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return result
+
     if len(session.turns) == before:
         # An infrastructure failure produced no policy tokens. Keep the error as
         # environment context, never as a fabricated assistant generation.

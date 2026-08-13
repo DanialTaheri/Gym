@@ -350,8 +350,55 @@ def _write_capture_manifest(
     turns: list[Any],
     result: dict[str, Any] | None = None,
     video_input_mode: str = "key-frame-aware",
+    session_id: str = "",
+    run_metadata: dict[str, Any] | None = None,
 ) -> None:
-    """Persist compact evidence for token-history and media-turn verification."""
+    """Persist exact, exportable main-policy states and compact diagnostics."""
+
+    def externalize_request_media(
+        request_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        request_kwargs = copy.deepcopy(request_kwargs)
+        for message in request_kwargs.get("messages") or []:
+            if not isinstance(message, dict) or not isinstance(
+                message.get("content"), list
+            ):
+                continue
+            for part in message["content"]:
+                if not isinstance(part, dict):
+                    continue
+                url = _part_url(part)
+                if not url:
+                    continue
+                if url.startswith("data:"):
+                    suffix = _suffix_for_url(url, ".bin")
+                    media_digest = hashlib.sha256(url.encode()).hexdigest()
+                    output_path = (
+                        session_dir
+                        / "pivot_media"
+                        / f"{media_digest}{suffix}"
+                    )
+                    materialized = (
+                        str(output_path)
+                        if output_path.exists()
+                        else _materialize_url(url, output_path)
+                    )
+                    replacement = Path(materialized).resolve().as_uri()
+                elif "://" not in url:
+                    replacement = Path(url).expanduser().resolve().as_uri()
+                else:
+                    replacement = url
+
+                for key in ("image_url", "video_url", "video", "url"):
+                    value = part.get(key)
+                    if isinstance(value, dict) and "url" in value:
+                        value["url"] = replacement
+                        break
+                    if isinstance(value, str):
+                        part[key] = replacement
+                        break
+        return request_kwargs
+
     manifest_turns: list[dict[str, Any]] = []
     previous_sequence: list[int] = []
     for index, turn in enumerate(turns):
@@ -386,6 +433,7 @@ def _write_capture_manifest(
                 "request_message_prefix_length": turn.request_message_prefix_length,
                 "history_prefix_length": len(previous_sequence),
                 "history_prefix_matches": prompt_ids[: len(previous_sequence)] == previous_sequence,
+                "request_kwargs": externalize_request_media(turn.request_kwargs),
             }
         )
         previous_sequence = prompt_ids + generation_ids
@@ -394,16 +442,62 @@ def _write_capture_manifest(
     (session_dir / "rl_capture.json").write_text(
         json.dumps(
             {
+                "format": "spatialclaw_pivot_capture/v1",
+                "session_id": session_id,
                 "video_input_mode": video_input_mode,
                 "turn_count": len(turns),
                 "turns": manifest_turns,
                 "final_answer": str(final_answer.get("text") or ""),
                 "termination_reason": str(result.get("termination_reason") or ""),
+                "run_metadata": run_metadata or {},
             },
             indent=2,
         ),
         encoding="utf-8",
     )
+
+
+def _record_capture_verification(
+    workspace_root: str,
+    agent_json: dict[str, Any],
+    verify_json: dict[str, Any],
+) -> None:
+    """Attach the normal verifier result to its persistent expert capture.
+
+    This is diagnostic/export metadata only. The reward returned to NeMo RL is
+    unchanged. Keeping it beside the exact request capture avoids joining a
+    W&B table back to thousands of concurrent session directories later.
+    """
+    metadata = agent_json.get("metadata") or {}
+    session_id = metadata.get("spatialclaw_session_id")
+    if not session_id:
+        return
+    session_id = _session_id(session_id)
+    capture_path = (
+        Path(workspace_root).expanduser().resolve() / session_id / "rl_capture.json"
+    )
+    if not capture_path.is_file():
+        return
+
+    capture = json.loads(capture_path.read_text(encoding="utf-8"))
+    fields = (
+        "reward",
+        "expected_answer",
+        "scoring_mode",
+        "scoring_mode_used",
+        "scorer_supported",
+        "extracted_answer",
+        "turns_used",
+        "termination_reason",
+    )
+    capture["verification"] = {
+        field: copy.deepcopy(verify_json[field])
+        for field in fields
+        if field in verify_json
+    }
+    temporary_path = capture_path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(capture, indent=2), encoding="utf-8")
+    temporary_path.replace(capture_path)
 
 
 class SpatialClawAgent(SimpleResponsesAPIAgent):
@@ -793,6 +887,8 @@ class SpatialClawAgent(SimpleResponsesAPIAgent):
                     turns,
                     result,
                     video_input_mode=self.config.video_input_mode,
+                    session_id=session_id,
+                    run_metadata=run_metadata,
                 )
             except Exception:
                 # Uvicorn is launched as a managed Gym subprocess and its
@@ -856,6 +952,7 @@ class SpatialClawAgent(SimpleResponsesAPIAgent):
                 tools=body.tools,
                 parallel_tool_calls=body.parallel_tool_calls,
                 metadata={
+                    "spatialclaw_session_id": session_id,
                     "spatialclaw_final_answer": str(final_answer),
                     "spatialclaw_termination_reason": str(result.get("termination_reason") or ""),
                     "spatialclaw_turns": str(len(turns)),
@@ -907,13 +1004,20 @@ class SpatialClawAgent(SimpleResponsesAPIAgent):
         await raise_for_status(verify)
         verify_json = await get_response_json(verify)
         metadata = agent_json.get("metadata") or {}
-        return SpatialClawAgentVerifyResponse.model_validate(
+        result = SpatialClawAgentVerifyResponse.model_validate(
             verify_json
             | {
                 "turns_used": int(metadata.get("spatialclaw_turns", 0) or 0),
                 "termination_reason": metadata.get("spatialclaw_termination_reason"),
             }
         )
+        if self.config.keep_workspaces:
+            _record_capture_verification(
+                self.config.workspace_root,
+                agent_json,
+                result.model_dump(),
+            )
+        return result
 
     async def aggregate_metrics(
         self, body: AggregateMetricsRequest = Body()
