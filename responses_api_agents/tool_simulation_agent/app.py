@@ -45,10 +45,17 @@ class ToolSimulationAgent(SimpleResponsesAPIAgent):
     config: ToolSimulationAgentConfig
 
     async def responses(self, body: NeMoGymResponseCreateParamsNonStreaming = Body()) -> NeMoGymResponse:
+        request_json = body.model_dump(exclude_none=True)
+        # The OpenAI/vLLM Responses API accepts either one or more tools or no
+        # tool-related fields. Empty tools plus ``tool_choice`` is invalid, but
+        # is a natural intermediate value for tool-free one-step decisions.
+        if not request_json.get("tools"):
+            for field in ("tools", "tool_choice", "parallel_tool_calls"):
+                request_json.pop(field, None)
         model_response = await self.server_client.post(
             server_name=self.config.model_server.name,
             url_path="/v1/responses",
-            json=body,
+            json=request_json,
         )
 
         # Model calls are expected to always succeed.

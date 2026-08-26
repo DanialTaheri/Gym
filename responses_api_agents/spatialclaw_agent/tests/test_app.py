@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ from responses_api_agents.spatialclaw_agent.app import (
     _configure_video_role_preprocessing,
     _finish_timed_out_capture,
     _minimum_frame_retry_fps,
+    _record_capture_verification,
     _session_id,
 )
 
@@ -61,6 +63,34 @@ def test_session_id_accepts_filename_safe_value():
 
 def test_session_id_generates_uuid_when_value_is_empty():
     assert len(_session_id("")) == 32
+
+
+def test_record_capture_verification_preserves_exact_capture(tmp_path):
+    session_dir = tmp_path / "session-a"
+    session_dir.mkdir()
+    capture_path = session_dir / "rl_capture.json"
+    capture_path.write_text(
+        json.dumps({"format": "spatialclaw_pivot_capture/v1", "turns": [1]})
+    )
+
+    _record_capture_verification(
+        str(tmp_path),
+        {"metadata": {"spatialclaw_session_id": "session-a"}},
+        {
+            "reward": 1.0,
+            "expected_answer": "B",
+            "scoring_mode": "mcqa",
+            "response": {"large": "not copied"},
+        },
+    )
+
+    capture = json.loads(capture_path.read_text())
+    assert capture["turns"] == [1]
+    assert capture["verification"] == {
+        "reward": 1.0,
+        "expected_answer": "B",
+        "scoring_mode": "mcqa",
+    }
 
 
 def test_timed_out_capture_keeps_real_turns_and_uses_empty_answer(monkeypatch):

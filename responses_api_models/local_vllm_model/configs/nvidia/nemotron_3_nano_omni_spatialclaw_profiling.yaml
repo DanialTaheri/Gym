@@ -1,0 +1,48 @@
+policy_model:
+  responses_api_models:
+    local_vllm_model:
+      entrypoint: app.py
+      model: ${policy_model_name}
+      return_token_id_information: false
+      # Corrected-v2 SFT is non-thinking. Enabling DeepSeek's parser moves its
+      # visible SpatialClaw markdown/code into a reasoning-only response item,
+      # leaving the action verifier with no output_text.
+      uses_reasoning_parser: false
+      replace_developer_role_with_system: false
+      sequential_reasoning_allowed: false
+      chat_template_kwargs:
+        enable_thinking: false
+      extra_body:
+        bad_words: ["<image>", "<img>", "</img>", "<so_embedding>", "<so_start>", "<so_end>"]
+      hf_home: null
+      debug: false
+
+      vllm_serve_env_vars:
+        VLLM_RAY_DP_PACK_STRATEGY: strict
+
+      # Single-node frozen-policy server used only to profile one-step pivots.
+      vllm_serve_kwargs:
+        data_parallel_size: 1
+        tensor_parallel_size: 8
+        pipeline_parallel_size: 1
+        trust_remote_code: true
+        mamba_ssm_cache_dtype: float32
+        gpu_memory_utilization: 0.9
+        max_model_len: 49152
+        max_num_seqs: 1
+        max_num_batched_tokens: 49152
+        allowed_local_media_path: /lustre
+        limit_mm_per_prompt:
+          image: 512
+          video:
+            count: 1
+            num_frames: 256
+        mm_processor_cache_gb: 0
+        enable_chunked_prefill: false
+        enable_prefix_caching: false
+        enforce_eager: true
+        disable_custom_all_reduce: true
+        attention_backend: FLASH_ATTN
+        model_loader_extra_config:
+          enable_multithread_load: true
+          num_threads: 16
