@@ -1,0 +1,40 @@
+spatialclaw_agent:
+  responses_api_agents:
+    spatialclaw_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: spatialclaw_resources
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      spatialclaw_root: ${oc.env:SPATIALCLAW_ROOT}
+      model_name: ${policy_model_name}
+      dataset_config: erqa_spatialclaw
+      main_mm_processor_kwargs:
+        max_num_tiles: 1
+      # Preserve SpatialClaw's original selected-key-frame model input unless
+      # a run explicitly asks the trainable main session to receive video media.
+      video_input_mode: key-frame-aware
+      compact_main_prompt: false
+      compact_planner_prompt: false
+      temperature: 1.0
+      top_p: 1.0
+      max_output_tokens: null
+      auxiliary_max_output_tokens: null
+      main_enable_thinking: null
+      main_thinking_token_budget: null
+      main_reasoning_budget: null
+      auxiliary_enable_thinking: null
+      auxiliary_thinking_token_budget: null
+      auxiliary_reasoning_budget: null
+      # The force-termination VLM is an isolated, non-trainable model session.
+      # It can use a larger response cap without changing main-agent history.
+      finalizer_max_output_tokens: null
+      finalizer_enable_thinking: null
+      finalizer_thinking_token_budget: null
+      finalizer_reasoning_budget: null
+      concurrency: 4
+      timeout: 1800
+      workspace_root: ${oc.env:SPATIALCLAW_WORKSPACE_ROOT,outputs/spatialclaw_agent}
+      keep_workspaces: false

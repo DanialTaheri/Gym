@@ -683,12 +683,14 @@ class TestApp:
     async def test_sanity(self, monkeypatch: MonkeyPatch) -> None:
         self._setup_server(monkeypatch)
 
-    def test_tokenize_body_keeps_multimodal_processor_kwargs(self) -> None:
+    def test_tokenize_body_keeps_prompt_affecting_agent_fields(self) -> None:
         body_dict = {
             "model": "dummy_model",
             "messages": [{"role": "user", "content": "hello"}],
             "chat_template_kwargs": {"enable_thinking": True},
             "mm_processor_kwargs": {"precomputed_imgs_sizes": [[480, 1024]]},
+            "required_prefix_token_ids": [11, 12, 13],
+            "required_prefix_message_count": 1,
             "bad_words": ["<image>"],
         }
 
@@ -699,6 +701,8 @@ class TestApp:
             "messages": [{"role": "user", "content": "hello"}],
             "chat_template_kwargs": {"enable_thinking": True},
             "mm_processor_kwargs": {"precomputed_imgs_sizes": [[480, 1024]]},
+            "required_prefix_token_ids": [11, 12, 13],
+            "required_prefix_message_count": 1,
         }
 
     def test_responses_marks_context_length_exceeded_on_preflight(
@@ -757,7 +761,7 @@ class TestApp:
         assert chat_response.status_code == 200
         chat_data = chat_response.json()
         assert chat_data["id"] == "chtcmpl-context-length-exceeded"
-        assert chat_data["choices"][0]["finish_reason"] == "context_length_exceeded"
+        assert chat_data["choices"][0]["finish_reason"] == "length"
         assert chat_data["context_length_exceeded"] is True
         assert mock_client.create_chat_completion.await_count == 0
 
@@ -3474,6 +3478,71 @@ class TestVLLMConverter:
         assert captured_kwargs["chat_template_kwargs"]["enable_thinking"] is False
         assert captured_kwargs["chat_template_kwargs"]["some_other_param"] == "value2"
         assert captured_kwargs["chat_template_kwargs"]["new_param"] == "new"
+
+    def test_direct_chat_template_kwargs_preserve_agent_history_options(self):
+        config = VLLMModelConfig(
+            host="0.0.0.0",
+            port=8081,
+            base_url="http://api.openai.com/v1",
+            api_key="dummy_key",  # pragma: allowlist secret
+            model="dummy_model",
+            entrypoint="",
+            name="",
+            return_token_id_information=False,
+            uses_reasoning_parser=False,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        server = VLLMModel(
+            config=config, server_client=MagicMock(spec=ServerClient)
+        )
+        body_dict = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {
+                "truncate_history_thinking": False,
+                "enable_thinking": False,
+            },
+        }
+
+        processed = server._preprocess_chat_completion_create_params(
+            request=MagicMock(), body_dict=body_dict
+        )
+
+        assert processed["chat_template_kwargs"] == {
+            "enable_thinking": False,
+            "truncate_history_thinking": False,
+        }
+
+    def test_chat_schema_keeps_vllm_agent_extensions(self):
+        body = NeMoGymChatCompletionCreateParamsNonStreaming.model_validate(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "reasoning_content": "prior reasoning",
+                        "prompt_token_ids": [1, 2],
+                        "generation_token_ids": [3],
+                        "generation_log_probs": [-0.25],
+                    }
+                ],
+                "chat_template_kwargs": {"truncate_history_thinking": False},
+                "mm_processor_kwargs": {"max_num_patches": 1024},
+                "required_prefix_token_ids": [1, 2, 3],
+                "required_prefix_message_count": 1,
+            }
+        )
+
+        dumped = body.model_dump(exclude_unset=True)
+        assert dumped["messages"][0]["reasoning_content"] == "prior reasoning"
+        assert dumped["messages"][0]["prompt_token_ids"] == [1, 2]
+        assert dumped["messages"][0]["generation_token_ids"] == [3]
+        assert dumped["messages"][0]["generation_log_probs"] == [-0.25]
+        assert dumped["chat_template_kwargs"] == {
+            "truncate_history_thinking": False
+        }
+        assert dumped["mm_processor_kwargs"] == {"max_num_patches": 1024}
+        assert dumped["required_prefix_token_ids"] == [1, 2, 3]
+        assert dumped["required_prefix_message_count"] == 1
 
     def test_metadata_extra_body_override(self, monkeypatch: MonkeyPatch):
         config = VLLMModelConfig(
