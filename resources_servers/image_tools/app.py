@@ -342,11 +342,13 @@ def answers_match(expected: str, actual: Optional[str]) -> bool:
     is graded exactly like the answer-based environment grades the same task."""
     if actual is None:
         return False
+
     def norm(x):
         x = unicodedata.normalize("NFKC", str(x)).strip().lower()
         x = x.strip("\"'` ")
         x = re.sub(r"\s+", " ", x)
         return x.rstrip(".")
+
     return norm(expected) == norm(actual)
 
 
@@ -526,7 +528,7 @@ class ImageToolsPivotResourcesServer(SimpleResourcesServer):
                     state["model_output"] = f"{rollout_calls[0].get('name')}(...)"
                     return self._build(body, state)
                 got = extract_final_answer(text)
-                state["model_output"] = (got if got is not None else text[-300:])
+                state["model_output"] = got if got is not None else text[-300:]
                 if got is None:
                     state["reward"] = 0.0
                     state["failure_reason"] = FailureCode.ANSWER_MISSING

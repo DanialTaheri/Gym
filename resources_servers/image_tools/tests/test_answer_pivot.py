@@ -19,12 +19,14 @@ calling tools and answer. Unlike the generic pivot server, which pays 1.0 for
 any chat message, reward here is conditional on the answer being correct --
 otherwise the objective rewards giving up early.
 """
+
 import ast
 import pathlib
 import re
 import unicodedata
 
 import pytest
+
 
 # Importing app.py pulls in fastapi/ray/omegaconf via nemo_gym, which are not
 # present outside the server venv. The reward semantics under test are pure, so
@@ -52,6 +54,7 @@ FailureCode = _ns["FailureCode"]
 
 
 # --- extraction ------------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     "text,expected",
@@ -84,14 +87,15 @@ def test_no_think_tag_still_extracts():
 
 # --- matching --------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     "gold,got,ok",
     [
         ("4", "4", True),
-        ("D", "d", True),                 # case-insensitive
-        ("cricket ball", " Cricket  Ball ", True),   # whitespace + case
-        ("left", "left.", True),          # trailing period
-        ("6", '"6"', True),               # stray quotes
+        ("D", "d", True),  # case-insensitive
+        ("cricket ball", " Cricket  Ball ", True),  # whitespace + case
+        ("left", "left.", True),  # trailing period
+        ("6", '"6"', True),  # stray quotes
         ("6", "9", False),
         ("(5,16)", "(5,17)", False),
         ("4", None, False),
@@ -121,7 +125,7 @@ def test_answer_branch_precedes_the_no_tool_call_guard():
     """Ordering is load-bearing: if the __answer__ check came after
     `if not rollout_calls`, every terminal row would be scored
     NO_TOOL_CALL_IN_ROLLOUT (reward 0) and the objective would be unchanged."""
-    answer_branch = _SRC.index(f'if expected.get("name") == _ANSWER_ACTION')
+    answer_branch = _SRC.index('if expected.get("name") == _ANSWER_ACTION')
     no_call_guard = _SRC.index("if not rollout_calls:")
     assert answer_branch < no_call_guard
 
@@ -129,7 +133,7 @@ def test_answer_branch_precedes_the_no_tool_call_guard():
 def test_answer_branch_covers_all_three_outcomes():
     """A terminal row must distinguish: answered correctly, answered wrongly,
     never answered, and kept calling tools."""
-    branch = _SRC[_SRC.index('if expected.get("name") == _ANSWER_ACTION'):]
+    branch = _SRC[_SRC.index('if expected.get("name") == _ANSWER_ACTION') :]
     branch = branch[: branch.index("if not rollout_calls:")]
     for code in (
         "TOOL_CALL_WHEN_ANSWER_EXPECTED",
@@ -143,7 +147,7 @@ def test_answer_branch_covers_all_three_outcomes():
 def test_wrong_answer_is_not_rewarded_like_the_generic_pivot_server():
     """The generic server pays 1.0 for *any* chat message. Here reward must be
     gated on answers_match, or the objective pays the model to guess early."""
-    branch = _SRC[_SRC.index('if expected.get("name") == _ANSWER_ACTION'):]
+    branch = _SRC[_SRC.index('if expected.get("name") == _ANSWER_ACTION') :]
     branch = branch[: branch.index("if not rollout_calls:")]
     assert "answers_match(gold, got)" in branch
 
