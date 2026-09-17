@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from resources_servers.sav_tracks.app import (
     SavTracksRunRequest,
     _extract_answer_json,
@@ -207,7 +210,13 @@ def test_pt_multi_object_mean():
 def test_box_exact_iou_scores_one():
     body = make_body(
         "box",
-        [{"id": 1, "reference_bbox": [0, 0, 100, 100], "targets": [{"frame": 1, "visible": True, "bbox": [100, 100, 300, 300]}]}],
+        [
+            {
+                "id": 1,
+                "reference_bbox": [0, 0, 100, 100],
+                "targets": [{"frame": 1, "visible": True, "bbox": [100, 100, 300, 300]}],
+            }
+        ],
     )
     entries, format_ok = parse("box", '{"tracks":[{"box":1,"frame":1,"bbox":[100,100,300,300],"visible":true}]}')
     assert format_ok

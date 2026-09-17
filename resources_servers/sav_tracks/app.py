@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """SA-V "tracks"-schema verifier: point / box / text-referred tracking.
 
@@ -31,6 +32,7 @@ weighted equally). GT-invisible frames pay absence_score for a correct
 invisibility claim and 0 for any location. Extra / duplicate / invalid entries
 scale the reward down by targets/(targets+extras). Format failures score 0.
 """
+
 import itertools
 import json
 import math
@@ -377,7 +379,9 @@ def _iou(pred: list[float], target: list[float]) -> float:
     return intersection / union if union > 0 else 0.0
 
 
-def _localization_score(task: TaskType, entry: ParsedEntry, target: TrackTarget) -> tuple[float, float, Optional[bool]]:
+def _localization_score(
+    task: TaskType, entry: ParsedEntry, target: TrackTarget
+) -> tuple[float, float, Optional[bool]]:
     """Score a visible prediction against a visible target: (score, iou, in_mask)."""
     if task == "box":
         if entry.bbox is None or target.bbox is None:
@@ -593,9 +597,7 @@ def _score_tracks(
         reward *= total_targets / (total_targets + extra_count)
 
     visible_frame_scores = [fs for score in object_scores for fs in score.frame_scores if fs.gt_visible]
-    mean_iou = (
-        sum(fs.iou for fs in visible_frame_scores) / len(visible_frame_scores) if visible_frame_scores else 0.0
-    )
+    mean_iou = sum(fs.iou for fs in visible_frame_scores) / len(visible_frame_scores) if visible_frame_scores else 0.0
     mask_checked = [fs for fs in visible_frame_scores if fs.in_mask is not None]
     in_mask_rate = sum(1 for fs in mask_checked if fs.in_mask) / len(mask_checked) if mask_checked else None
     visibility_accuracy = sum(score.visibility_correct for score in object_scores) / total_targets
