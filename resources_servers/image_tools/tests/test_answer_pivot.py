@@ -1,172 +1,212 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Terminal-answer ("message expectation") rows for the image_tools pivot env.
 
-A row whose expected_action is the __answer__ sentinel asks the model to STOP
-calling tools and answer. Unlike the generic pivot server, which pays 1.0 for
-any chat message, reward here is conditional on the answer being correct --
-otherwise the objective rewards giving up early.
-"""
+"""Exercise terminal rewards through the real verifier, not source-text guards."""
 
-import ast
-import pathlib
-import re
-import unicodedata
+import json
+from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+from pydantic import ValidationError
+
+from nemo_gym.server_utils import ServerClient
+from resources_servers.image_tools.app import (
+    FailureCode,
+    ImageToolsPivotResourcesServer,
+    ImageToolsPivotResourcesServerConfig,
+    ImageToolsPivotVerifyRequest,
+)
+from resources_servers.string_match.app import (
+    StringMatchResourcesServer,
+    StringMatchResourcesServerConfig,
+    StringMatchVerifyRequest,
+)
+from responses_api_agents.tool_simulation_agent.app import ToolSimulationAgentVerifyRequest
 
 
-# Importing app.py pulls in fastapi/ray/omegaconf via nemo_gym, which are not
-# present outside the server venv. The reward semantics under test are pure, so
-# load just those definitions from the source instead -- this keeps the test
-# runnable anywhere and still fails if app.py's logic changes.
-_APP = pathlib.Path(__file__).resolve().parents[1] / "app.py"
-_ns = {"re": re, "unicodedata": unicodedata, "Optional": __import__("typing").Optional}
-_tree = ast.parse(_APP.read_text(encoding="utf-8"))
-_want_fn = {"extract_final_answer", "answers_match"}
-for _node in _tree.body:
-    if isinstance(_node, ast.FunctionDef) and _node.name in _want_fn:
-        exec(compile(ast.Module([_node], []), "app", "exec"), _ns)
-    elif isinstance(_node, ast.Assign) and any(
-        getattr(t, "id", None) in ("_ANSWER_ACTION", "_BOXED_RE") for t in _node.targets
-    ):
-        exec(compile(ast.Module([_node], []), "app", "exec"), _ns)
-    elif isinstance(_node, ast.ClassDef) and _node.name == "FailureCode":
-        _src = ast.get_source_segment(_APP.read_text(encoding="utf-8"), _node)
-        exec("from enum import Enum\n" + _src, _ns)
-
-extract_final_answer = _ns["extract_final_answer"]
-answers_match = _ns["answers_match"]
-_ANSWER_ACTION = _ns["_ANSWER_ACTION"]
-FailureCode = _ns["FailureCode"]
+@pytest.fixture
+def server() -> ImageToolsPivotResourcesServer:
+    return ImageToolsPivotResourcesServer(
+        config=ImageToolsPivotResourcesServerConfig(host="localhost", port=0, entrypoint="app.py"),
+        server_client=MagicMock(spec=ServerClient),
+    )
 
 
-# --- extraction ------------------------------------------------------------
+def make_request(text: str, **row: Any) -> ImageToolsPivotVerifyRequest:
+    return ImageToolsPivotVerifyRequest.model_validate(
+        {
+            "responses_create_params": {"input": "Answer the question."},
+            "response": {
+                "id": "test-response",
+                "created_at": 1,
+                "model": "unit-model",
+                "object": "response",
+                "output": [
+                    {
+                        "id": "test-message",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": text, "annotations": []}],
+                    }
+                ],
+                "parallel_tool_calls": False,
+                "tool_choice": "auto",
+                "tools": [],
+            },
+            "expected_action": {"name": "__answer__", "arguments": {"answer": "4"}},
+            **row,
+        }
+    )
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "text,expected",
+    "text,mode,gold,case_sensitive,reward",
     [
-        ("<think>maybe 3</think>\nThe answer is \\boxed{4}", "4"),
-        ("<think>x</think>\n\\boxed{(5,16)}", "(5,16)"),
-        ("<think>y</think>\nFinal answer: cricket ball", "cricket ball"),
-        ("<think>z</think>\nAnswer: left.", "left"),
-        # last boxed wins when several appear after </think>
-        ("<think>t</think>\n\\boxed{1} then \\boxed{2}", "2"),
-        # no answer at all
-        ("<think>still thinking</think>\n", None),
-        ("", None),
+        ("4", "last_line", "4", False, 1.0),
+        ("4", "full_response", "4", False, 1.0),
+        ("4", "boxed", "4", False, 0.0),
+        ("4", "final_answer", "4", False, 0.0),
+        (r"\boxed{4.0}", "boxed", "4", False, 1.0),
+        (r"\boxed{\text{4}}", "boxed", "4", False, 1.0),
+        (r"\boxed{\frac{1}{2}}", "boxed", r"\frac{1}{2}", False, 1.0),
+        (r"\boxed{1} then \boxed{4}", "boxed", "4", False, 1.0),
+        ("Answer: 1\nAnswer: 4", "final_answer", "4", False, 1.0),
+        (r"\boxed{1} Answer: 4", "final_answer", "4", False, 1.0),
+        (r"\boxed{4}", "final_answer", "4", False, 1.0),
+        ("Answer: left.", "final_answer", "left", False, 1.0),
+        ("Answer: d", "final_answer", "D", False, 1.0),
+        ("Answer: d", "final_answer", "D", True, 0.0),
+        ("Answer: D", "final_answer", "D", True, 1.0),
+        ("Answer: 4.0", "final_answer", "4", True, 0.0),
+        (r'\boxed{"6"}', "boxed", "6", False, 1.0),
+        (r"\boxed{Cricket  Ball}", "boxed", "cricket ball", False, 1.0),
+        (r"\boxed{(5,16)}", "boxed", "(5,17)", False, 0.0),
+        (r"\boxed{6}", "boxed", "9", False, 0.0),
+        # Shared grading can return partial credit; don't coerce it to bool.
+        (r"\boxed{100.1}", "boxed", "100", False, 0.98),
     ],
 )
-def test_extract_final_answer(text, expected):
-    assert extract_final_answer(text) == expected
+async def test_terminal_reward_matches_string_match(
+    server: ImageToolsPivotResourcesServer,
+    text: str,
+    mode: str,
+    gold: str,
+    case_sensitive: bool,
+    reward: float,
+) -> None:
+    body = make_request(
+        text,
+        extraction_mode=mode,
+        case_sensitive=case_sensitive,
+        expected_action={"name": "__answer__", "arguments": {"answer": gold}},
+    )
+    result = await server.verify(body)
+    reference = StringMatchResourcesServer(
+        config=StringMatchResourcesServerConfig(name="string_match", host="localhost", port=0, entrypoint="app.py"),
+        server_client=MagicMock(spec=ServerClient),
+    )
+    shared_result = await reference.verify(
+        StringMatchVerifyRequest.model_validate({**body.model_dump(), "expected_answer": gold})
+    )
+    assert result.reward == shared_result.reward == reward
+    assert result.expected_tool_name == "__answer__"
+    assert result.tool_family == "answer"
+    assert result.num_rollout_tool_calls == 0
+    if reward:
+        assert result.failure_reason == FailureCode.NONE
+    elif shared_result.extracted_answer is None:
+        assert result.failure_reason == FailureCode.ANSWER_MISSING
+    else:
+        assert result.failure_reason == FailureCode.ANSWER_INCORRECT
 
 
-def test_boxed_inside_think_is_not_an_answer():
-    """Mirrors the eval harness: only the segment after the last </think> counts,
-    so a boxed answer stranded in the reasoning must not be extracted."""
-    assert extract_final_answer("<think>\\boxed{7} hmm</think>\n") is None
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["boxed", "final_answer", "last_line", "full_response"])
+@pytest.mark.parametrize("answer", ["", "\n"])
+async def test_reasoning_only_is_not_an_answer(server: ImageToolsPivotResourcesServer, mode: str, answer: str) -> None:
+    result = await server.verify(make_request(r"<think>\boxed{4}</think>" + answer, extraction_mode=mode))
+    assert result.reward == 0.0
+    assert result.failure_reason == FailureCode.ANSWER_MISSING
 
 
-def test_no_think_tag_still_extracts():
-    """rsplit returns the whole string when </think> is absent."""
-    assert extract_final_answer("\\boxed{9}") == "9"
+@pytest.mark.asyncio
+async def test_reasoning_is_removed_before_extraction(server: ImageToolsPivotResourcesServer) -> None:
+    result = await server.verify(make_request("<think>wrong guess</think>\n4", extraction_mode="full_response"))
+    assert result.reward == 1.0
+    assert result.model_output == "4"
 
 
-# --- matching --------------------------------------------------------------
-
-
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "gold,got,ok",
+    "arguments,text",
     [
-        ("4", "4", True),
-        ("D", "d", True),  # case-insensitive
-        ("cricket ball", " Cricket  Ball ", True),  # whitespace + case
-        ("left", "left.", True),  # trailing period
-        ("6", '"6"', True),  # stray quotes
-        ("6", "9", False),
-        ("(5,16)", "(5,17)", False),
-        ("4", None, False),
+        ({}, r"\boxed{}"),
+        ({"answer": None}, "Answer: None"),
+        ({"answer": ""}, r"\boxed{}"),
+        ({"answer": " \t\n"}, r"\boxed{}"),
+        ({"answer": []}, "Answer: []"),
+        ({"answer": {}}, "Answer: {}"),
+        ({"answer": False}, "Answer: False"),
+        ({"answer": float("nan")}, "Answer: nan"),
+        ({"answer": float("inf")}, "Answer: inf"),
+        (None, r"\boxed{}"),
+        ([], r"\boxed{}"),
+        ("not JSON", r"\boxed{}"),
+        ('{"answer": null}', "Answer: None"),
     ],
 )
-def test_answers_match(gold, got, ok):
-    assert answers_match(gold, got) is ok
+async def test_invalid_terminal_action_is_never_rewarded(
+    server: ImageToolsPivotResourcesServer, arguments: Any, text: str
+) -> None:
+    result = await server.verify(make_request(text, expected_action={"name": "__answer__", "arguments": arguments}))
+    assert result.reward == 0.0
+    assert result.failure_reason == FailureCode.EXPECTED_ACTION_INVALID
 
 
-# --- the verify branch (source-level guards) --------------------------------
-#
-# The branch itself lives inside the server's async verify(), which cannot be
-# imported here (fastapi/ray). These guards assert the properties that would
-# silently break terminal rows if app.py were edited.
-
-_SRC = _APP.read_text(encoding="utf-8")
-
-
-def test_sentinel_is_distinct_from_any_real_tool():
-    """The sentinel must never collide with a real tool name; every image tool
-    ends in _tool, so a dunder-style sentinel is unambiguous."""
-    assert _ANSWER_ACTION == "__answer__"
-    assert not _ANSWER_ACTION.endswith("_tool")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gold", [0, 0.0, "0"])
+async def test_zero_is_a_valid_expected_answer(server: ImageToolsPivotResourcesServer, gold: Any) -> None:
+    result = await server.verify(
+        make_request(r"\boxed{0}", expected_action={"name": "__answer__", "arguments": {"answer": gold}})
+    )
+    assert result.reward == 1.0
+    assert result.failure_reason == FailureCode.NONE
 
 
-def test_answer_branch_precedes_the_no_tool_call_guard():
-    """Ordering is load-bearing: if the __answer__ check came after
-    `if not rollout_calls`, every terminal row would be scored
-    NO_TOOL_CALL_IN_ROLLOUT (reward 0) and the objective would be unchanged."""
-    answer_branch = _SRC.index('if expected.get("name") == _ANSWER_ACTION')
-    no_call_guard = _SRC.index("if not rollout_calls:")
-    assert answer_branch < no_call_guard
+@pytest.mark.asyncio
+@pytest.mark.parametrize("location", ["expected_action", "metadata", "expected_answer"])
+async def test_terminal_action_locations(server: ImageToolsPivotResourcesServer, location: str) -> None:
+    action = {"name": "__answer__", "arguments": json.dumps({"answer": "4"})}
+    row = {"expected_action": None}
+    row[location] = {"expected_action": action} if location == "metadata" else action
+    if location == "expected_answer":
+        row[location] = json.dumps(action)
+    result = await server.verify(make_request(r"\boxed{4}", **row))
+    assert result.reward == 1.0
 
 
-def test_answer_branch_covers_all_three_outcomes():
-    """A terminal row must distinguish: answered correctly, answered wrongly,
-    never answered, and kept calling tools."""
-    branch = _SRC[_SRC.index('if expected.get("name") == _ANSWER_ACTION') :]
-    branch = branch[: branch.index("if not rollout_calls:")]
-    for code in (
-        "TOOL_CALL_WHEN_ANSWER_EXPECTED",
-        "ANSWER_MISSING",
-        "ANSWER_INCORRECT",
-    ):
-        assert code in branch, f"{code} not handled in the terminal branch"
-    assert 'state["reward"] = 1.0' in branch
+@pytest.mark.asyncio
+async def test_tool_call_rejected_even_with_correct_answer(server: ImageToolsPivotResourcesServer) -> None:
+    text = '<tool_call>{"name":"image_rotate_tool","arguments":{"img_idx":0,"degrees":90}}</tool_call>\nAnswer: 4'
+    result = await server.verify(make_request(text))
+    assert result.num_rollout_tool_calls == 1
+    assert result.reward == 0.0
+    assert result.failure_reason == FailureCode.TOOL_CALL_WHEN_ANSWER_EXPECTED
 
 
-def test_wrong_answer_is_not_rewarded_like_the_generic_pivot_server():
-    """The generic server pays 1.0 for *any* chat message. Here reward must be
-    gated on answers_match, or the objective pays the model to guess early."""
-    branch = _SRC[_SRC.index('if expected.get("name") == _ANSWER_ACTION') :]
-    branch = branch[: branch.index("if not rollout_calls:")]
-    assert "answers_match(gold, got)" in branch
+@pytest.mark.asyncio
+async def test_agent_schema_preserves_answer_options(server: ImageToolsPivotResourcesServer) -> None:
+    body = make_request("4", extraction_mode="full_response", case_sensitive=True)
+    forwarded = ToolSimulationAgentVerifyRequest.model_validate(body.model_dump()).model_dump()
+    assert forwarded["extraction_mode"] == "full_response"
+    assert forwarded["case_sensitive"] is True
+    result = await server.verify(ImageToolsPivotVerifyRequest.model_validate(forwarded))
+    assert result.reward == 1.0
 
 
-def test_module_imports_every_name_it_uses_at_module_scope():
-    """Regression guard for a real failure: the helpers used `re` and
-    `unicodedata` while app.py imported neither, so the resources server died at
-    startup with NameError -- after py_compile passed and after these tests
-    passed, because the loader above injects those modules into the namespace.
-    Assert the real file imports them.
-    """
-    tree = ast.parse(_SRC)
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                imported.add((a.asname or a.name).split(".")[0])
-        elif isinstance(node, ast.ImportFrom):
-            for a in node.names:
-                imported.add(a.asname or a.name)
-    for name in ("re", "unicodedata", "Optional"):
-        assert name in imported, f"app.py uses {name} but never imports it"
+def test_invalid_extraction_mode_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="extraction_mode"):
+        make_request("4", extraction_mode="unsupported")

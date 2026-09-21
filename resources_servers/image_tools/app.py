@@ -37,10 +37,9 @@ Tool families in the bvstyle tool-call data:
 
 import json
 import logging
-import re
-import unicodedata
+import math
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import FastAPI
 from pydantic import ConfigDict
@@ -52,6 +51,7 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+from resources_servers.string_match.app import _answers_match, _extract_answer
 
 
 # Reuse the exact parser and IoU the image-tools agent uses at rollout time, so
@@ -321,37 +321,6 @@ def compute_argument_score(
 # ---------------------------------------------------------------------------
 
 
-_BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
-
-
-def extract_final_answer(text: str) -> Optional[str]:
-    """Answer from the segment after the last </think>, matching how the eval
-    harness reads a final turn. Prefer \\boxed{}; fall back to 'Answer: ...'."""
-    tail = (text or "").rsplit("</think>", 1)[-1]
-    hits = _BOXED_RE.findall(tail)
-    if hits:
-        return hits[-1].strip()
-    m = re.search(r"(?i)(?:final\s+answer|answer)\s*[:\uff1a]\s*(.+)", tail)
-    if m:
-        return m.group(1).strip().rstrip(".")
-    return None
-
-
-def answers_match(expected: str, actual: Optional[str]) -> bool:
-    """Deliberately the same normalisation string_match uses, so a terminal row
-    is graded exactly like the answer-based environment grades the same task."""
-    if actual is None:
-        return False
-
-    def norm(x):
-        x = unicodedata.normalize("NFKC", str(x)).strip().lower()
-        x = x.strip("\"'` ")
-        x = re.sub(r"\s+", " ", x)
-        return x.rstrip(".")
-
-    return norm(expected) == norm(actual)
-
-
 # Sentinel tool name marking a terminal (answer) expectation.
 _ANSWER_ACTION = "__answer__"
 
@@ -400,6 +369,8 @@ class ImageToolsPivotRunRequest(BaseRunRequest):
     uuid: Optional[str | int] = None
     expected_action: Optional[dict[str, Any]] = None
     expected_answer: Optional[str] = None
+    extraction_mode: Literal["boxed", "final_answer", "last_line", "full_response"] = "final_answer"
+    case_sensitive: bool = False
     metadata: Optional[dict[str, Any]] = None
 
 
@@ -520,23 +491,36 @@ class ImageToolsPivotResourcesServer(SimpleResourcesServer):
             if expected.get("name") == _ANSWER_ACTION:
                 state["tool_family"] = "answer"
                 state["expected_tool_name"] = _ANSWER_ACTION
-                gold = str(expected.get("arguments", {}).get("answer", ""))
+                gold = expected["arguments"].get("answer")
+                # Validate before coercion: None and empty answers must never
+                # become rewardable targets. Numeric zero remains a valid answer.
+                if (
+                    not isinstance(gold, (str, int, float))
+                    or isinstance(gold, bool)
+                    or (isinstance(gold, float) and not math.isfinite(gold))
+                    or not str(gold).strip()
+                ):
+                    state["failure_reason"] = FailureCode.EXPECTED_ACTION_INVALID
+                    return self._build(body, state)
+                gold = str(gold)
                 state["expected_answer_text"] = gold
                 if rollout_calls:
                     state["reward"] = 0.0
                     state["failure_reason"] = FailureCode.TOOL_CALL_WHEN_ANSWER_EXPECTED
                     state["model_output"] = f"{rollout_calls[0].get('name')}(...)"
                     return self._build(body, state)
-                got = extract_final_answer(text)
+                # Keep reasoning out of the final answer, while using the same
+                # extraction modes and grading as the answer-based environment.
+                tail = text.rsplit("</think>", 1)[-1]
+                got = _extract_answer(tail, body.extraction_mode)
                 state["model_output"] = got if got is not None else text[-300:]
-                if got is None:
+                if got is None or not got.strip():
                     state["reward"] = 0.0
                     state["failure_reason"] = FailureCode.ANSWER_MISSING
-                elif answers_match(gold, got):
-                    state["reward"] = 1.0
                 else:
-                    state["reward"] = 0.0
-                    state["failure_reason"] = FailureCode.ANSWER_INCORRECT
+                    state["reward"] = _answers_match(got, gold, body.case_sensitive)
+                    if state["reward"] == 0.0:
+                        state["failure_reason"] = FailureCode.ANSWER_INCORRECT
                 return self._build(body, state)
 
             if not rollout_calls:
