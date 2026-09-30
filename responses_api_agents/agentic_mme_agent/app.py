@@ -161,10 +161,17 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
                 )
                 image_url = result.get("image_url")
                 observation = {key: value for key, value in result.items() if key != "image_url"}
-                outputs.append(NeMoGymFunctionCallOutput(call_id=call.call_id, output=json.dumps(observation)))
+                # Set type explicitly: requests are serialized with exclude_unset, and the model
+                # server's converter cannot route an item that has neither type nor role.
+                outputs.append(
+                    NeMoGymFunctionCallOutput(
+                        type="function_call_output", call_id=call.call_id, output=json.dumps(observation)
+                    )
+                )
                 if image_url:
                     image_observations.append(
                         NeMoGymEasyInputMessage(
+                            type="message",
                             role="user",
                             content=[
                                 {"type": "input_text", "text": f"Image {result['new_image_index']}"},
