@@ -3,9 +3,11 @@
 
 """Agentic-MME task-only scoring; process judgments are deliberately not rewards."""
 
+import asyncio
+import json
 import math
 import re
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -16,6 +18,9 @@ from nemo_gym.base_resources_server import (
     ReverifyMode,
     SimpleResourcesServer,
 )
+from nemo_gym.config_types import ModelServerRef
+from nemo_gym.judge import JudgeError, call_judge
+from nemo_gym.openai_utils import NeMoGymChatCompletion
 
 
 class GoldenAnswer(BaseModel):
@@ -65,8 +70,77 @@ def matches_answer(answer: str, golden: GoldenAnswer) -> bool:
     return target.lower() in answer.lower()
 
 
+JUDGE_SYSTEM = """You are a strict grader. You decide ONE thing: whether the model's FINAL \
+answer matches the reference answer.
+
+Judge only the final answer the model commits to (normally inside <answer>...</answer>), not its \
+reasoning. Differences that do NOT matter: units, casing, whitespace, LaTeX wrappers, \
+spelled-out vs numeric digits, ordering where the question does not ask for an order \
+(e.g. groups of matching items), trailing punctuation, extra prose around the answer.
+
+These make it WRONG: a different number, a different option letter, a different coordinate, \
+a different colour, a different count, a different set of items, or several conflicting \
+final answers.
+
+You are NOT solving the problem and you cannot see any image. If the model gives no final \
+answer, or you cannot tell what it asserts, answer "unsure".
+
+Reply with ONLY a JSON object:
+{"verdict": "equivalent" | "different" | "unsure", "confidence": 0.0-1.0, "reason": "<12 words"}
+("equivalent" = the final answer is correct.)"""
+
+JUDGE_USER = """Question:
+{question}
+
+Reference answer (gold):
+{expected}
+
+What the extractor pulled out of the model's response:
+{extracted}
+
+The model's final response text (may be truncated):
+<<<
+{text}
+>>>
+
+Is the model's final answer correct?"""
+
+
+def parse_verdict(content: str) -> dict[str, Any]:
+    match = re.search(r"\{.*\}", content or "", re.S)
+    try:
+        data = json.loads(match.group(0)) if match else {}
+    except json.JSONDecodeError:
+        data = {}
+    verdict = str(data.get("verdict", "unsure")).lower().strip()
+    if verdict not in ("equivalent", "different", "unsure"):
+        verdict = "unsure"
+    return {"verdict": verdict, "reason": str(data.get("reason", ""))[:200]}
+
+
+def question_text(params: Any) -> str:
+    """Text of the last user message; images are not sent to the judge."""
+    items = params.input if not isinstance(params.input, str) else [{"role": "user", "content": params.input}]
+    for item in reversed(list(items)):
+        data = item if isinstance(item, dict) else item.model_dump()
+        if data.get("role") != "user":
+            continue
+        content = data.get("content")
+        if isinstance(content, str):
+            return content
+        return "\n".join(part.get("text", "") for part in content or [] if part.get("type") == "input_text")
+    return ""
+
+
 class AgenticMMEConfig(BaseResourcesServerConfig):
     REVERIFY_MODE: ClassVar[ReverifyMode] = ReverifyMode.STATELESS
+    # When set, an LLM judge decides correctness and string match is kept only as a diagnostic.
+    judge_model_server: Optional[ModelServerRef] = None
+    judge_model: str = ""
+    judge_temperature: float = 0.0
+    judge_max_tokens: int = 1024
+    judge_max_concurrency: int = Field(default=32, ge=1)
+    judge_max_text_chars: int = Field(default=8000, ge=1)
 
 
 class AgenticMMEVerifyRequest(BaseVerifyRequest):
@@ -79,10 +153,37 @@ class AgenticMMEVerifyResponse(BaseVerifyResponse):
     extracted_answer: str = ""
     failure_reason: str | None = None
     evaluation_track: str = "task_only"
+    string_match_reward: float | None = None
+    judge_verdict: str | None = None
+    judge_reason: str | None = None
 
 
 class AgenticMMEServer(SimpleResourcesServer):
     config: AgenticMMEConfig
+    _judge_slots: asyncio.Semaphore | None = None
+
+    async def judge(self, question: str, expected: str, extracted: str, text: str) -> dict[str, Any]:
+        if self._judge_slots is None:
+            self._judge_slots = asyncio.Semaphore(self.config.judge_max_concurrency)
+        prompt = JUDGE_USER.format(
+            question=question, expected=expected, extracted=extracted or "(nothing)",
+            text=text[-self.config.judge_max_text_chars :],
+        )
+        params = {
+            "model": self.config.judge_model,
+            "messages": [{"role": "system", "content": JUDGE_SYSTEM}, {"role": "user", "content": prompt}],
+            "temperature": self.config.judge_temperature,
+            "max_tokens": self.config.judge_max_tokens,
+        }
+        async with self._judge_slots:
+            completion = await call_judge(
+                self.server_client,
+                server_name=self.config.judge_model_server.name,
+                url_path="/v1/chat/completions",
+                json=params,
+                response_model=NeMoGymChatCompletion,
+            )
+        return parse_verdict(completion.choices[0].message.content or "")
 
     async def verify(self, body: AgenticMMEVerifyRequest) -> AgenticMMEVerifyResponse:
         result = AgenticMMEVerifyResponse(**body.model_dump(), reward=0.0)
@@ -101,8 +202,23 @@ class AgenticMMEServer(SimpleResourcesServer):
         if body.response.incomplete_details:
             result.failure_reason = "incomplete_response"
             return result
-        result.extracted_answer = extract_answer("\n".join(terminal))
-        result.reward = float(matches_answer(result.extracted_answer, golden))
+        final_text = "\n".join(terminal)
+        result.extracted_answer = extract_answer(final_text)
+        result.string_match_reward = float(matches_answer(result.extracted_answer, golden))
+        result.reward = result.string_match_reward
+        if self.config.judge_model_server is not None and result.extracted_answer:
+            try:
+                judged = await self.judge(
+                    question_text(body.responses_create_params), str(golden.value), result.extracted_answer, final_text
+                )
+            except JudgeError as exc:
+                result.reward = 0.0
+                result.failure_reason = "judge_error"
+                result.judge_reason = str(exc)[:500]
+                return result
+            result.judge_verdict = judged["verdict"]
+            result.judge_reason = judged["reason"]
+            result.reward = float(judged["verdict"] == "equivalent")
         if not result.reward:
             result.failure_reason = "incorrect_answer" if result.extracted_answer else "missing_answer"
         return result
