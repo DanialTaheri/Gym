@@ -100,3 +100,105 @@ async def test_terminal_tool_and_incomplete_do_not_score(server) -> None:
         response("blue").model_dump() | {"incomplete_details": {"reason": "max_output_tokens"}}
     )
     assert (await server.verify(body)).failure_reason == "incomplete_response"
+
+
+def completion(content: str):
+    from nemo_gym.openai_utils import NeMoGymChatCompletion
+
+    return NeMoGymChatCompletion.model_validate(
+        {
+            "id": "judge",
+            "created": 0,
+            "model": "judge",
+            "object": "chat.completion",
+            "choices": [
+                {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": content}}
+            ],
+        }
+    )
+
+
+@pytest.fixture
+def judged_server() -> AgenticMMEServer:
+    return AgenticMMEServer(
+        config=AgenticMMEConfig(
+            name="agentic_mme",
+            host="localhost",
+            port=1,
+            entrypoint="",
+            judge_model_server={"type": "responses_api_models", "name": "judge"},
+        ),
+        server_client=MagicMock(spec=ServerClient),
+    )
+
+
+def judged_request(text: str, value: str = "44.6 million") -> AgenticMMEVerifyRequest:
+    return AgenticMMEVerifyRequest(
+        responses_create_params={
+            "input": [
+                {"role": "system", "content": "system"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Image 0."},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA==", "detail": "auto"},
+                        {"type": "input_text", "text": "How much was it sold for?"},
+                    ],
+                },
+            ]
+        },
+        response=response(text),
+        verifier_metadata={"golden_answer": {"value": value, "match_type": "exact"}},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict", "reward"),
+    [
+        ('{"verdict": "equivalent", "confidence": 0.9, "reason": "same amount"}', 1.0),
+        ('```json\n{"verdict": "different", "reason": "other number"}\n```', 0.0),
+        ('{"verdict": "unsure"}', 0.0),
+        ("not json", 0.0),
+    ],
+)
+async def test_judge_decides_reward(judged_server, monkeypatch, verdict, reward) -> None:
+    seen = {}
+
+    async def fake_call_judge(client, *, server_name, url_path, json, response_model):
+        seen.update(server_name=server_name, url_path=url_path, messages=json["messages"])
+        return completion(verdict)
+
+    monkeypatch.setattr("resources_servers.agentic_mme.app.call_judge", fake_call_judge)
+    # String match fails (exact), so any reward comes from the judge.
+    result = await judged_server.verify(judged_request("<answer>$44.6M</answer>"))
+    assert result.reward == reward
+    assert result.string_match_reward == 0.0
+    assert seen["server_name"] == "judge" and seen["url_path"] == "/v1/chat/completions"
+    user = seen["messages"][1]["content"]
+    assert "How much was it sold for?" in user and "44.6 million" in user and "$44.6M" in user
+    assert "base64" not in user
+    assert result.failure_reason == (None if reward else "incorrect_answer")
+
+
+@pytest.mark.asyncio
+async def test_judge_error_scores_zero(judged_server, monkeypatch) -> None:
+    from nemo_gym.judge import JudgeError
+
+    async def failing_call_judge(*args, **kwargs):
+        raise JudgeError("judge down")
+
+    monkeypatch.setattr("resources_servers.agentic_mme.app.call_judge", failing_call_judge)
+    result = await judged_server.verify(judged_request("<answer>44.6 million</answer>"))
+    assert result.reward == 0.0 and result.failure_reason == "judge_error"
+    assert result.string_match_reward == 1.0
+
+
+@pytest.mark.asyncio
+async def test_judge_skipped_without_answer(judged_server, monkeypatch) -> None:
+    async def unexpected_call(*args, **kwargs):
+        raise AssertionError("judge must not be called without an answer")
+
+    monkeypatch.setattr("resources_servers.agentic_mme.app.call_judge", unexpected_call)
+    result = await judged_server.verify(judged_request("<answer></answer>"))
+    assert result.reward == 0.0 and result.failure_reason == "missing_answer"
