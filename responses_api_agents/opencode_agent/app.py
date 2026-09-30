@@ -14,12 +14,10 @@
 # limitations under the License.
 
 import asyncio
-import base64
 import copy
 import json
 import logging
 import os
-import re
 import shlex
 import shutil
 import sqlite3
@@ -465,51 +463,13 @@ def _extract_instruction(body_input) -> tuple[str, Optional[str]]:
         if role == "user":
             content = getattr(item, "content", None) or (item.get("content") if isinstance(item, dict) else None)
             if isinstance(content, list):
-                content = "\n".join(
-                    text
-                    for text in (
-                        (p.get("text", "") if isinstance(p, dict) else getattr(p, "text", "")) for p in content
-                    )
-                    if text
+                content = "".join(
+                    (p.get("text", "") if isinstance(p, dict) else getattr(p, "text", "")) for p in content
                 )
             user_message = content or ""
             break
 
     return user_message, system_message
-
-
-_IMAGE_SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp"}
-
-
-def _extract_images(body_input) -> list[tuple[str, bytes]]:
-    """(suffix, bytes) of the data-URL images in the last user message, in order."""
-    for item in reversed(list(body_input)):
-        role = getattr(item, "role", None) or (item.get("role") if isinstance(item, dict) else None)
-        if role != "user":
-            continue
-        content = getattr(item, "content", None) or (item.get("content") if isinstance(item, dict) else None)
-        images = []
-        for part in content if isinstance(content, list) else []:
-            data = part if isinstance(part, dict) else part.model_dump()
-            url = data.get("image_url") if data.get("type") == "input_image" else None
-            match = re.match(r"data:(image/[a-z]+);base64,(.*)", url or "", re.S)
-            if match and match.group(1) in _IMAGE_SUFFIXES:
-                images.append((_IMAGE_SUFFIXES[match.group(1)], base64.b64decode(match.group(2))))
-        return images
-    return []
-
-
-def _fill_placeholders(value: Any, values: dict[str, str]) -> Any:
-    """Substitute {name} placeholders in every string of a nested config."""
-    if isinstance(value, str):
-        for name, replacement in values.items():
-            value = value.replace("{" + name + "}", replacement)
-        return value
-    if isinstance(value, dict):
-        return {k: _fill_placeholders(v, values) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_fill_placeholders(v, values) for v in value]
-    return value
 
 
 class OpenCodeAgentConfig(BaseResponsesAPIAgentConfig):
@@ -533,15 +493,6 @@ class OpenCodeAgentConfig(BaseResponsesAPIAgentConfig):
     context_window: int = 262144
     max_output_tokens: int = 131072
     opencode_version: Optional[str] = None
-    # Multimodal tasks: write the last user message's images into the run dir and attach them
-    # with -f. `vision` declares a generated (model_server) model entry image-capable.
-    attach_images: bool = False
-    vision: bool = False
-    # False: drop the input's system message (e.g. when an opencode_config agent carries it).
-    include_input_system_prompt: bool = True
-    # If the final assistant text lacks this pattern, continue the session once with this prompt.
-    final_answer_regex: Optional[str] = None
-    final_answer_prompt: Optional[str] = None
 
     @property
     def command_parts(self) -> list[str]:
@@ -624,29 +575,19 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                     "name": self.config.model,
                     "interleaved": {"field": "reasoning"},
                     "limit": {"context": self.config.context_window, "output": self.config.max_output_tokens},
-                    **(
-                        {"attachment": True, "modalities": {"input": ["text", "image"], "output": ["text"]}}
-                        if self.config.vision
-                        else {}
-                    ),
                 },
             )
             nemo["models"] = {self.config.model: model}
         return config
 
-    def _write_opencode_config(
-        self, work_dir: Path, rollout_id: Optional[str] = None, placeholders: Optional[dict[str, str]] = None
-    ) -> None:
-        config = _fill_placeholders(self._build_opencode_config(rollout_id), placeholders or {})
+    def _write_opencode_config(self, work_dir: Path, rollout_id: Optional[str] = None) -> None:
+        config = self._build_opencode_config(rollout_id)
         if not config:
             return
         (work_dir / "opencode.json").write_text(json.dumps(config, indent=2))
 
     def _env(self, data_home: str, rollout_id: Optional[str] = None) -> dict[str, str]:
-        # OpenCode writes to all four XDG dirs; keep them in the run dir (read-only $HOME clusters).
         env = {**os.environ, "XDG_DATA_HOME": data_home}
-        for name in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
-            env[name] = str(Path(data_home).parent / f".opencode-{name.split('_')[1].lower()}")
         base_url = (
             self._resolve_model_base_url(rollout_id) if self.config.model_server else self.config.openai_base_url
         )
@@ -668,7 +609,6 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         *,
         rollout_id: Optional[str] = None,
         collect_observations: bool = True,
-        images: Optional[list[tuple[str, bytes]]] = None,
     ) -> tuple[list[Any], dict[str, int], str, AgentObservationBundle]:
         """Run one headless OpenCode session and read its persisted artifact."""
         prompt = instruction if not system_prompt else f"{system_prompt}\n\n{instruction}"
@@ -676,28 +616,19 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         project_dir = self._repo_dir(work_dir)
         data_home = work_dir / ".opencode-data"
         data_home.mkdir(parents=True, exist_ok=True)
-        images_dir = work_dir / "images"
-        images_dir.mkdir(exist_ok=True)
-        files = []
-        for index, (suffix, data) in enumerate(images or []):
-            path = images_dir / f"image_{index}{suffix}"
-            path.write_bytes(data)
-            files.append(str(path.resolve()))
-        placeholders = {"images_dir": str(images_dir.resolve()), "gym_root": str(Path(__file__).resolve().parents[2])}
-        self._write_opencode_config(project_dir, rollout_id, placeholders)
+        self._write_opencode_config(project_dir, rollout_id)
         env = self._env(str(data_home), rollout_id)
 
-        base_cmd = [*self.config.command_parts, "run", "-m", self._effective_model(), "--dir", str(project_dir)]
+        cmd = [*self.config.command_parts, "run", "-m", self._effective_model(), "--dir", str(project_dir)]
         if self.config.thinking:
-            base_cmd.append("--thinking")
-        # Repeated -f (an array flag), after the positional prompt so it cannot absorb it.
-        cmd = [*base_cmd, *self.config.extra_args, prompt, *(arg for f in files for arg in ("-f", f))]
+            cmd.append("--thinking")
+        cmd.extend(self.config.extra_args)
+        cmd.append(prompt)
 
-        stderr_tail = {"text": ""}
-
-        async def execute(command: list[str]) -> tuple[Optional[int], bool]:
+        try:
+            timed_out = False
             proc = await asyncio.create_subprocess_exec(
-                *command,
+                *cmd,
                 cwd=str(project_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -707,35 +638,18 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 _, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.config.timeout)
             except asyncio.TimeoutError:
                 proc.kill()
-                await proc.communicate()
+                _, stderr = await proc.communicate()
+                timed_out = True
                 LOG.warning("opencode timed out after %ds", self.config.timeout)
-                return proc.returncode, True
-            stderr_tail["text"] = stderr.decode(errors="replace")[-2000:]
+
             if proc.returncode not in (0, None):
-                LOG.warning("opencode exited %d: %s", proc.returncode, stderr_tail["text"][-500:])
-            return proc.returncode, False
+                LOG.warning("opencode exited %d: %s", proc.returncode, stderr.decode(errors="replace")[:500])
 
-        try:
-            returncode, timed_out = await execute(cmd)
             db_path = data_home / "opencode" / "opencode.db"
-            if not timed_out and self.config.final_answer_regex and self.config.final_answer_prompt:
-                answered = False
-                for item in reversed(parse_opencode_session(db_path)[0]):
-                    if getattr(item, "type", None) == "message" and getattr(item, "role", None) == "assistant":
-                        text = "".join(getattr(part, "text", "") for part in item.content)
-                        answered = re.search(self.config.final_answer_regex, text, re.S | re.I) is not None
-                        break
-                if not answered:
-                    continue_cmd = [*base_cmd, "--continue", *self.config.extra_args, self.config.final_answer_prompt]
-                    returncode, timed_out = await execute(continue_cmd)
-
             invocation_id = rollout_id or f"opencode-{uuid4().hex}"
             output_items, usage = (
                 ([], {"input_tokens": 0, "output_tokens": 0}) if timed_out else parse_opencode_session(db_path)
             )
-            if not output_items and not timed_out:
-                # A clean exit with an empty session hides OpenCode's own error; surface it.
-                LOG.warning("opencode produced an empty session (rc=%s): %s", returncode, stderr_tail["text"])
             observations = AgentObservationBundle(source="opencode")
             if collect_observations:
                 try:
@@ -751,7 +665,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                             ObservationGap(code="model_call_ownership_unavailable"),
                         ],
                     )
-            run_status = "incomplete" if timed_out else "completed" if returncode == 0 else "failed"
+            run_status = "incomplete" if timed_out else "completed" if proc.returncode == 0 else "failed"
             for invocation in observations.records:
                 if not isinstance(invocation, AgentInvocation):
                     continue
@@ -775,9 +689,6 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             body.input = [NeMoGymEasyInputMessage(role="user", content=body.input)]
 
         user_message, input_system = _extract_instruction(body.input)
-        if not self.config.include_input_system_prompt:
-            input_system = None
-        images = _extract_images(body.input) if self.config.attach_images else []
         system_parts = [p for p in [self.config.system_prompt, input_system] if p]
         system_prompt = "\n\n".join(system_parts) if system_parts else None
         prompt = user_message if system_prompt is None else f"{system_prompt}\n\n{user_message}"
@@ -787,7 +698,6 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             system_prompt,
             rollout_id=rollout_id,
             collect_observations=collect_observations,
-            images=images,
         )
         if collect_observations:
             observations.gaps.append(ObservationGap(code="no_sandbox_runtime"))
