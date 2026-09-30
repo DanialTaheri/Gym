@@ -288,3 +288,12 @@ async def test_refused_model_call_ends_episode_unanswered() -> None:
     result = await agent.run(request(), body())
     assert result.reward == 0 and result.failure_reason == "policy_error"
     assert "request_too_large" in result.policy_error and result.tool_call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_no_round_or_tool_call_limit() -> None:
+    outputs = [response(output=[call(call_id=f"c{i}")]) for i in range(20)] + [response("<answer>red</answer>")]
+    agent, seen = make_agent(outputs, max_rounds=None, max_tool_calls=None)
+    result = await agent.run(request(), body())
+    assert result.reward == 1 and result.tool_call_count == 20 and result.tool_error_count == 0
+    assert all(request_json["tools"] for request_json in seen)  # never forced into answer-only mode

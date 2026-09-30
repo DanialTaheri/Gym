@@ -23,6 +23,9 @@ agentic_mme:
 agentic_mme_agent:
   responses_api_agents:
     agentic_mme_agent:
+      # No round or tool-call limit: the model decides when to answer.
+      max_rounds: null
+      max_tool_calls: null
       datasets:
       - name: agentic_mme
         type: benchmark

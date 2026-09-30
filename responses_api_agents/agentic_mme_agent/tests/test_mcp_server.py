@@ -52,3 +52,10 @@ def test_errors_and_budget(tmp_path: Path) -> None:
     assert not rpc(tool_server, "tools/call", {"name": "flip", "arguments": {"image_index": 0}})["result"]["isError"]
     spent = rpc(tool_server, "tools/call", {"name": "flip", "arguments": {"image_index": 0}})["result"]
     assert spent["isError"] and "budget" in spent["content"][0]["text"]
+
+
+def test_no_budget_by_default(tmp_path: Path) -> None:
+    Image.new("RGB", (8, 4), "red").save(tmp_path / "image_0.png")
+    tool_server = ToolServer(tmp_path)
+    for _ in range(20):
+        assert not rpc(tool_server, "tools/call", {"name": "flip", "arguments": {"image_index": 0}})["result"]["isError"]

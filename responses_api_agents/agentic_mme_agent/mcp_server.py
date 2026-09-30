@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """The Agentic-MME atomic image tools as a stdio MCP server, for CLI harnesses such as OpenCode.
 
-    python mcp_server.py --images-dir <dir with image_0.png, image_1.jpg, ...> [--max-tool-calls 15]
+    python mcp_server.py --images-dir <dir with image_0.png, image_1.jpg, ...> [--max-tool-calls N]
 
 Same tools, schemas and semantics as agentic_mme_agent (tools.ImageWorkspace): the task's
 images are indexed 0, 1, ... in file order, each successful operation appends one image, and
-every attempted call, valid or not, consumes the budget. A result carries the new image as MCP
+every attempted call, valid or not, consumes the budget (none unless --max-tool-calls is given). A result carries the new image as MCP
 `image` content so the harness shows it to the model, like agentic_mme_agent's image message.
 
 Only the protocol surface a harness uses is implemented (initialize, tools/list, tools/call,
@@ -31,7 +31,7 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
 
 class ToolServer:
-    def __init__(self, images_dir: Path, max_tool_calls: int) -> None:
+    def __init__(self, images_dir: Path, max_tool_calls: int | None = None) -> None:
         self.workspace = ImageWorkspace()
         for path in sorted(p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES):
             self.workspace.load(image_data_url_from_file(path))
@@ -46,7 +46,7 @@ class ToolServer:
 
     def call(self, name: str, arguments: Any) -> tuple[list[dict[str, Any]], bool]:
         try:
-            if self.attempts >= self.max_tool_calls:
+            if self.max_tool_calls is not None and self.attempts >= self.max_tool_calls:
                 raise ValueError("tool budget exhausted; provide a final answer")
             self.attempts += 1  # Invalid calls consume budget too.
             if not isinstance(arguments, dict):
@@ -93,7 +93,7 @@ def image_data_url_from_file(path: Path) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--images-dir", type=Path, required=True)
-    parser.add_argument("--max-tool-calls", type=int, default=15)
+    parser.add_argument("--max-tool-calls", type=int, default=None)
     args = parser.parse_args()
     server = ToolServer(args.images_dir, args.max_tool_calls)
     for line in sys.stdin:

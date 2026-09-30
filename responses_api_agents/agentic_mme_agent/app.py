@@ -4,6 +4,7 @@
 """Native multi-turn atomic Agentic-MME harness with append-only model history."""
 
 import asyncio
+import itertools
 import json
 from typing import Any
 
@@ -31,8 +32,10 @@ from responses_api_agents.agentic_mme_agent.tools import IMAGE_TOOLS, ImageWorks
 class AgenticMMEAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: ModelServerRef
-    max_rounds: int = Field(default=15, ge=1, le=100)
-    max_tool_calls: int = Field(default=15, ge=0, le=100)
+    # None removes the limit: the episode then ends when the model answers without a tool call,
+    # or when the model call fails (e.g. the context is full), recorded as policy_error.
+    max_rounds: int | None = Field(default=15, ge=1, le=100)
+    max_tool_calls: int | None = Field(default=15, ge=0, le=100)
     max_concurrent_rollouts: int = Field(default=8, ge=1)
     max_image_pixels: int = Field(default=16_000_000, ge=1)
     max_total_image_pixels: int = Field(default=64_000_000, ge=1)
@@ -105,8 +108,10 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
         policy_error = None
         generated = None
         # Reserve an additional final-answer-only call when the interaction budget ends.
-        for turn in range(self.config.max_rounds + 1):
-            final_only = turn == self.config.max_rounds or attempts >= self.config.max_tool_calls
+        max_rounds, max_tool_calls = self.config.max_rounds, self.config.max_tool_calls
+        rounds = itertools.count() if max_rounds is None else range(max_rounds + 1)
+        for turn in rounds:
+            final_only = turn == max_rounds or (max_tool_calls is not None and attempts >= max_tool_calls)
             new_params = params.model_copy(
                 update={
                     "input": [*params.input, *outputs],
@@ -140,7 +145,7 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
             for call in calls:
                 arguments = None
                 try:
-                    if final_only or attempts >= self.config.max_tool_calls:
+                    if final_only or (max_tool_calls is not None and attempts >= max_tool_calls):
                         raise ValueError("tool budget exhausted; provide a final answer")
                     attempts += 1  # Invalid calls consume budget too.
                     arguments = json.loads(call.arguments)
