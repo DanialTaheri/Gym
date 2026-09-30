@@ -267,3 +267,24 @@ async def test_wire_input_items_keep_their_type() -> None:
     wire = model_calls[1]["json"].model_dump(exclude_unset=True)["input"]
     assert [item.get("type") for item in wire[-2:]] == ["function_call_output", "message"]
     assert all(item.get("type") or item.get("role") for item in wire)
+
+
+@pytest.mark.asyncio
+async def test_refused_model_call_ends_episode_unanswered() -> None:
+    # e.g. an endpoint's request-size limit after several tool images: the rollout is scored 0
+    # with the error recorded, instead of a 500 that aborts the whole collection.
+    refused = FakeResponse(b"", {})
+    refused.ok, refused.status = False, 400
+    refused.read = AsyncMock(return_value=b'{"error": {"code": "request_too_large"}}')
+    agent, seen = make_agent([response(output=[call()])])
+    post = agent.server_client.post.side_effect
+
+    async def post_or_refuse(**kwargs):
+        if kwargs["url_path"] == "/v1/responses" and len(seen) == 1:
+            return refused
+        return await post(**kwargs)
+
+    agent.server_client.post.side_effect = post_or_refuse
+    result = await agent.run(request(), body())
+    assert result.reward == 0 and result.failure_reason == "policy_error"
+    assert "request_too_large" in result.policy_error and result.tool_call_count == 1

@@ -65,7 +65,7 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
         params: NeMoGymResponseCreateParamsNonStreaming,
         cookies: Any,
         replay: list[dict[str, Any]] | None = None,
-    ) -> tuple[NeMoGymResponse, list[dict[str, Any]], Any]:
+    ) -> tuple[NeMoGymResponse, list[dict[str, Any]], Any, str | None]:
         async with self._rollouts:
             workspace = ImageWorkspace(
                 max_pixels=self.config.max_image_pixels, max_total_pixels=self.config.max_total_image_pixels
@@ -78,7 +78,7 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
         cookies: Any,
         replay: list[dict[str, Any]] | None,
         workspace: ImageWorkspace,
-    ) -> tuple[NeMoGymResponse, list[dict[str, Any]], Any]:
+    ) -> tuple[NeMoGymResponse, list[dict[str, Any]], Any, str | None]:
         params = params.model_copy(deep=True)
         if isinstance(params.input, str):
             params.input = [NeMoGymEasyInputMessage(role="user", content=params.input)]
@@ -102,6 +102,8 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
         usage = None
         attempts = 0
         finished = False
+        policy_error = None
+        generated = None
         # Reserve an additional final-answer-only call when the interaction budget ends.
         for turn in range(self.config.max_rounds + 1):
             final_only = turn == self.config.max_rounds or attempts >= self.config.max_tool_calls
@@ -118,7 +120,11 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
                 json=new_params,
                 cookies=cookies,
             )
-            await raise_for_status(response)
+            if not response.ok:
+                # A refused model call (e.g. an endpoint's request-size limit once many tool images
+                # accumulate) ends this episode unanswered instead of failing the whole collection.
+                policy_error = f"HTTP {response.status}: {(await response.read()).decode(errors='replace')[:1000]}"
+                break
             cookies = response.cookies
             generated = NeMoGymResponse.model_validate(await get_response_json(response))
             usage = accumulate_response_usage(usage, generated.usage)
@@ -184,13 +190,26 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
             outputs.extend(image_observations)
             if final_only:
                 break
+        if generated is None:
+            generated = NeMoGymResponse.model_validate(
+                {
+                    "id": "policy_error",
+                    "created_at": 0,
+                    "model": "",
+                    "object": "response",
+                    "parallel_tool_calls": False,
+                    "tool_choice": "auto",
+                    "tools": [],
+                    "output": [],
+                }
+            )
         result = generated.model_copy(update={"output": outputs, "usage": usage})
         if not finished and result.incomplete_details is None:
             # No terminal answer must never accidentally score an earlier answer.
             result = NeMoGymResponse.model_validate(
                 result.model_dump() | {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
             )
-        return result, trace, cookies
+        return result, trace, cookies, policy_error
 
     async def responses(
         self,
@@ -198,13 +217,15 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
         response: Response,
         body: NeMoGymResponseCreateParamsNonStreaming = Body(),
     ) -> NeMoGymResponse:
-        result, _, cookies = await self._episode(body, request.cookies)
+        result, _, cookies, _ = await self._episode(body, request.cookies)
         for name, value in (cookies or {}).items():
             response.set_cookie(name, value)
         return result
 
     async def run(self, request: Request, body: AgenticMMERunRequest) -> AgenticMMEVerifyResponse:
-        result, trace, _ = await self._episode(body.responses_create_params, request.cookies, body.retrieval_replay)
+        result, trace, _, policy_error = await self._episode(
+            body.responses_create_params, request.cookies, body.retrieval_replay
+        )
         verification = await self.server_client.post(
             server_name=self.config.resources_server.name,
             url_path="/verify",
@@ -232,6 +253,8 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
                 "tool_error_count": len(trace) - successful,
                 "overthink": overthink,
                 "process_scores_available": False,
+                "policy_error": policy_error,
+                **({"failure_reason": "policy_error"} if policy_error else {}),
             }
         )
 
