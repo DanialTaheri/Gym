@@ -39,6 +39,7 @@ from responses_api_agents.opencode_agent.app import (
     OpenCodeAgent,
     OpenCodeAgentConfig,
     OpenCodeAgentRunRequest,
+    _extract_images,
     _extract_instruction,
     _parse_opencode_session,
     parse_opencode_session,
@@ -532,3 +533,99 @@ class TestConfigYaml:
         assert inner["entrypoint"] == "app.py"
         assert inner["concurrency"] == 8
         assert inner["command"] == "opencode"
+
+
+PNG = b"\x89PNG\r\n\x1a\nfake"
+
+
+def _image_input(text: str = "What is shown?") -> list:
+    return [
+        NeMoGymEasyInputMessage(role="system", content="solve it"),
+        NeMoGymEasyInputMessage(
+            role="user",
+            content=[
+                {"type": "input_text", "text": "Image 0."},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgpmYWtl", "detail": "auto"},
+                {"type": "input_image", "image_url": "https://example.com/not-a-data-url.png", "detail": "auto"},
+                {"type": "input_text", "text": text},
+            ],
+        ),
+    ]
+
+
+def _assistant(text: str) -> NeMoGymResponseOutputMessage:
+    return NeMoGymResponseOutputMessage.model_validate(
+        {
+            "id": "m",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }
+    )
+
+
+class TestMultimodal:
+    def test_text_parts_are_separated_and_data_url_images_extracted(self) -> None:
+        user, system = _extract_instruction(_image_input())
+        assert (user, system) == ("Image 0.\nWhat is shown?", "solve it")
+        assert _extract_images(_image_input()) == [(".png", PNG)]
+
+    def test_vision_marks_generated_model_entry(self) -> None:
+        agent = _make_agent(model="m", vision=True, model_server=ModelServerRef(type="responses_api_models", name="p"))
+        with patch.object(OpenCodeAgent, "_resolve_model_base_url", return_value="http://model/v1"):
+            entry = agent._build_opencode_config()["provider"]["nemo"]["models"]["m"]
+        assert entry["attachment"] is True and "image" in entry["modalities"]["input"]
+
+    async def test_images_attached_and_placeholders_filled(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        agent = _make_agent(
+            repo_dir=str(repo_dir),
+            opencode_config={"mcp": {"tools": {"command": ["{gym_root}/server.py", "--images-dir", "{images_dir}"]}}},
+        )
+        seen = {}
+
+        async def spawn(*cmd, **kwargs):
+            files = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-f"]
+            seen["files"] = {f: Path(f).read_bytes() for f in files}
+            seen["prompt_before_files"] = cmd.index("-f") > cmd.index("look")
+            process = MagicMock(returncode=0)
+            process.communicate = AsyncMock(return_value=(b"", b""))
+            return process
+
+        with (
+            patch.object(agent, "_workspace_root", return_value=tmp_path / "work"),
+            patch("responses_api_agents.opencode_agent.app.asyncio.create_subprocess_exec", side_effect=spawn),
+            patch("responses_api_agents.opencode_agent.app.parse_opencode_session", return_value=([], {})),
+        ):
+            await agent._run_opencode("look", None, collect_observations=False, images=[(".png", PNG)])
+
+        (path, data), = seen["files"].items()
+        assert Path(path).is_absolute() and path.endswith("images/image_0.png") and data == PNG
+        assert seen["prompt_before_files"]
+        command = json.loads((repo_dir / "opencode.json").read_text())["mcp"]["tools"]["command"]
+        assert command[2] == str(Path(path).parent) and "{gym_root}" not in command[0]
+
+    async def test_final_answer_retry_only_when_missing(self, tmp_path: Path) -> None:
+        for first_text, expected_runs in (("thinking...", 2), ("<answer>7</answer>", 1)):
+            agent = _make_agent(final_answer_regex="<answer>.*?</answer>", final_answer_prompt="Answer now.")
+            commands = []
+
+            async def spawn(*cmd, **kwargs):
+                commands.append(cmd)
+                process = MagicMock(returncode=0)
+                process.communicate = AsyncMock(return_value=(b"", b""))
+                return process
+
+            with (
+                patch.object(agent, "_workspace_root", return_value=tmp_path / f"w{expected_runs}"),
+                patch("responses_api_agents.opencode_agent.app.asyncio.create_subprocess_exec", side_effect=spawn),
+                patch(
+                    "responses_api_agents.opencode_agent.app.parse_opencode_session",
+                    return_value=([_assistant(first_text)], {}),
+                ),
+            ):
+                await agent._run_opencode("q", None, collect_observations=False)
+            assert len(commands) == expected_runs
+            if expected_runs == 2:
+                assert "--continue" in commands[1] and commands[1][-1] == "Answer now."
