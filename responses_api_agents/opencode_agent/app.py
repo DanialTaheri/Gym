@@ -693,6 +693,8 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         # Repeated -f (an array flag), after the positional prompt so it cannot absorb it.
         cmd = [*base_cmd, *self.config.extra_args, prompt, *(arg for f in files for arg in ("-f", f))]
 
+        stderr_tail = {"text": ""}
+
         async def execute(command: list[str]) -> tuple[Optional[int], bool]:
             proc = await asyncio.create_subprocess_exec(
                 *command,
@@ -708,8 +710,9 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 await proc.communicate()
                 LOG.warning("opencode timed out after %ds", self.config.timeout)
                 return proc.returncode, True
+            stderr_tail["text"] = stderr.decode(errors="replace")[-2000:]
             if proc.returncode not in (0, None):
-                LOG.warning("opencode exited %d: %s", proc.returncode, stderr.decode(errors="replace")[:500])
+                LOG.warning("opencode exited %d: %s", proc.returncode, stderr_tail["text"][-500:])
             return proc.returncode, False
 
         try:
@@ -730,6 +733,9 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             output_items, usage = (
                 ([], {"input_tokens": 0, "output_tokens": 0}) if timed_out else parse_opencode_session(db_path)
             )
+            if not output_items and not timed_out:
+                # A clean exit with an empty session hides OpenCode's own error; surface it.
+                LOG.warning("opencode produced an empty session (rc=%s): %s", returncode, stderr_tail["text"])
             observations = AgentObservationBundle(source="opencode")
             if collect_observations:
                 try:
