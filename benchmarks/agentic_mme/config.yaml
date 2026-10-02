@@ -7,7 +7,8 @@ agentic_mme_judge_model:
     openai_model:
       entrypoint: app.py
       openai_base_url: ${oc.select:agentic_mme_judge_base_url,https://inference-api.nvidia.com/v1}
-      openai_api_key: ${oc.env:OPENAI_API_KEY}
+      # Default empty: `gym eval prepare` loads this config without the run's key override.
+      openai_api_key: ${oc.env:OPENAI_API_KEY,""}
       openai_model: ${oc.select:agentic_mme_judge_model_name,us/azure/openai/gpt-4o-mini}
       openai_default_headers: {}
       max_concurrent_requests: 32
