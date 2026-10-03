@@ -31,7 +31,8 @@ from time import time
 from typing import Any, Optional
 from uuid import uuid4
 
-from fastapi import Request
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ConfigDict, Field
 
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
@@ -40,7 +41,9 @@ from nemo_gym.base_responses_api_agent import (
     Body,
     SimpleResponsesAPIAgent,
 )
+from nemo_gym.chat_streaming import sanitize_streaming_chat_body, synthesize_chat_completion_sse
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
+from nemo_gym.global_config import get_first_server_config_dict
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymFunctionCallOutput,
@@ -65,6 +68,12 @@ from nemo_gym.rollout_observability import (
 )
 from nemo_gym.server_utils import get_response_json, raise_for_status
 from responses_api_agents.opencode_agent.setup_opencode import ensure_opencode
+from responses_api_agents.opencode_agent.token_tracking import (
+    TrackedCall,
+    attach_parent_tokens,
+    chain_output_items,
+    record_call,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -557,6 +566,10 @@ class OpenCodeAgentConfig(BaseResponsesAPIAgentConfig):
     # Give each run a private /tmp (unshare --user --mount; needs unprivileged user namespaces).
     # Models write scratch files to fixed /tmp names, which concurrent runs would share.
     private_tmp: bool = False
+    # RL training: route OpenCode's model calls through this agent, which pins each call's
+    # prompt to the tokens sampled before and returns the calls' token IDs and logprobs as the
+    # rollout output (see token_tracking.py). Requires model_server and a single server worker.
+    track_token_ids: bool = False
 
     @property
     def command_parts(self) -> list[str]:
@@ -585,6 +598,11 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
 
     def model_post_init(self, __context: Any) -> None:
         self.sem = Semaphore(self.config.concurrency)
+        self._tracked_runs: dict[str, list[TrackedCall]] = {}
+        if self.config.track_token_ids and self.config.model_server is None:
+            raise ValueError("track_token_ids requires model_server")
+        if self.config.track_token_ids and (self.config.num_workers or 1) > 1:
+            raise ValueError("track_token_ids keeps per-run state in memory and needs num_workers <= 1")
         ensure_opencode(self.config.opencode_version)
         command = self.config.command_parts[0] if self.config.command_parts else ""
         if not command or shutil.which(command) is None:
@@ -616,21 +634,67 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         root.mkdir(parents=True, exist_ok=True)
         return root
 
-    def _resolve_model_base_url(self, rollout_id: Optional[str] = None) -> str:
+    def setup_webserver(self) -> FastAPI:
+        app = super().setup_webserver()
+        app.post("/ng-tok/{run_key}/v1/chat/completions")(self.tracked_chat_completions)
+        return app
+
+    def _resolve_model_base_url(self, rollout_id: Optional[str] = None, run_key: Optional[str] = None) -> str:
         if self.config.model_server is None:
             return ""
+        if run_key is not None:
+            server_config = get_first_server_config_dict(self.server_client.global_config_dict, self.config.name)
+            return f"{self.server_client._build_server_base_url(server_config)}/ng-tok/{run_key}/v1"
         return self.resolve_model_base_url(self.config.model_server.name, rollout_id)
+
+    async def tracked_chat_completions(self, run_key: str, request: Request) -> Response:
+        """OpenCode's model endpoint under track_token_ids: forward to the policy, keep the tokens."""
+        body = await request.json()
+        include_usage = False
+        stream = body.get("stream") is True
+        if stream:
+            body, include_usage = sanitize_streaming_chat_body(body)
+        calls = self._tracked_runs.get(run_key)
+        parent, new_images = attach_parent_tokens(body.get("messages") or [], calls or [])
+        model_resp = await self.server_client.post(
+            server_name=self.config.model_server.name,
+            url_path="/v1/chat/completions",
+            json=body,
+            cookies=request.cookies,
+        )
+        if not model_resp.ok:
+            return Response(
+                content=await model_resp.read(),
+                status_code=model_resp.status,
+                media_type=model_resp.headers.get("content-type"),
+            )
+        completion = await get_response_json(model_resp)
+        message = completion["choices"][0]["message"]
+        if calls is not None:
+            record_call(calls, parent, new_images, message)
+        else:
+            record_call([], parent, new_images, message)  # a late call after the run ended: just strip tokens
+        if stream:
+            return StreamingResponse(
+                synthesize_chat_completion_sse(completion, include_usage), media_type="text/event-stream"
+            )
+        return JSONResponse(completion)
 
     def _effective_model(self) -> str:
         return f"nemo/{self.config.model}" if self.config.model_server else self.config.model
 
-    def _build_opencode_config(self, rollout_id: Optional[str] = None) -> dict[str, Any]:
+    def _build_opencode_config(
+        self, rollout_id: Optional[str] = None, run_key: Optional[str] = None
+    ) -> dict[str, Any]:
         config = self._deep_merge({}, copy.deepcopy(self.config.opencode_config))
         if self.config.model_server:
             providers = config.setdefault("provider", {})
             nemo = providers.setdefault("nemo", {"npm": "@ai-sdk/openai-compatible"})
             nemo.setdefault("options", {}).update(
-                {"baseURL": self._resolve_model_base_url(rollout_id), "apiKey": "EMPTY"}  # pragma: allowlist secret
+                {
+                    "baseURL": self._resolve_model_base_url(rollout_id, run_key),
+                    "apiKey": "EMPTY",
+                }  # pragma: allowlist secret
             )
             model = nemo.setdefault("models", {}).get(self.config.model, {})
             self._deep_merge(
@@ -649,20 +713,24 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             nemo["models"] = {self.config.model: model}
         return config
 
-    def _write_opencode_config(self, work_dir: Path, rollout_id: Optional[str] = None) -> None:
-        config = self._build_opencode_config(rollout_id)
+    def _write_opencode_config(
+        self, work_dir: Path, rollout_id: Optional[str] = None, run_key: Optional[str] = None
+    ) -> None:
+        config = self._build_opencode_config(rollout_id, run_key)
         if not config:
             return
         (work_dir / "opencode.json").write_text(json.dumps(config, indent=2))
 
-    def _env(self, data_home: str, rollout_id: Optional[str] = None) -> dict[str, str]:
+    def _env(self, data_home: str, rollout_id: Optional[str] = None, run_key: Optional[str] = None) -> dict[str, str]:
         env = {**os.environ, "XDG_DATA_HOME": data_home}
         # OpenCode also writes its config/cache/state dirs; keep them in the run dir too
         # (clusters where $HOME is read-only).
         for name in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
             env[name] = str(Path(data_home).parent / f".opencode-{name.split('_')[1].lower()}")
         base_url = (
-            self._resolve_model_base_url(rollout_id) if self.config.model_server else self.config.openai_base_url
+            self._resolve_model_base_url(rollout_id, run_key)
+            if self.config.model_server
+            else self.config.openai_base_url
         )
         api_key = "EMPTY" if self.config.model_server else self.config.openai_api_key  # pragma: allowlist secret
         if base_url:
@@ -690,8 +758,11 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         project_dir = self._repo_dir(work_dir)
         data_home = work_dir / ".opencode-data"
         data_home.mkdir(parents=True, exist_ok=True)
-        self._write_opencode_config(project_dir, rollout_id)
-        env = self._env(str(data_home), rollout_id)
+        run_key = uuid4().hex if self.config.track_token_ids else None
+        if run_key is not None:
+            self._tracked_runs[run_key] = []
+        self._write_opencode_config(project_dir, rollout_id, run_key)
+        env = self._env(str(data_home), rollout_id, run_key)
         files = []
         for index, (suffix, data) in enumerate(images or []):
             path = project_dir / f"image_{index}{suffix}"
@@ -742,6 +813,10 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             output_items, usage = (
                 ([], {"input_tokens": 0, "output_tokens": 0}) if timed_out else parse_opencode_session(db_path)
             )
+            if run_key is not None:
+                # Training output: the model calls themselves, with their token IDs. A timed-out
+                # run keeps the calls it made (its reward is 0).
+                output_items = chain_output_items(self._tracked_runs[run_key], len(images or []))
             observations = AgentObservationBundle(source="opencode")
             if collect_observations:
                 try:
@@ -767,6 +842,8 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 observations.gaps.append(ObservationGap(code="agent_run_timeout"))
             return output_items, usage, self.config.model, observations
         finally:
+            if run_key is not None:
+                self._tracked_runs.pop(run_key, None)
             shutil.rmtree(work_dir, ignore_errors=True)
 
     async def _create_episode(
@@ -810,7 +887,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             ):
                 root.conversation = [NeMoGymEasyInputMessage(role="user", content=prompt), *root.conversation]
 
-        if not any(
+        if not self.config.track_token_ids and not any(
             getattr(item, "type", None) == "message" and getattr(item, "role", None) == "assistant"
             for item in output_items
         ):
