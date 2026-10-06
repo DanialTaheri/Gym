@@ -1,13 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded retrieval through Gym's shared aiohttp transport; explicit Lens upload opt-in."""
+"""Bounded retrieval through Gym's shared aiohttp transport; explicit Lens upload opt-in.
+
+mode "local" uses an offline Wikipedia retrieval service instead of the internet (no API keys):
+google_search -> POST {retriever_url}/search, google_lens_search -> POST {retriever_url}/lens with
+the image itself, fetch_webpage -> GET {retriever_url}/page for Wikipedia articles only. The
+service (E5 text index + SigLIP image index over Wikipedia) answers in Serper's JSON shape.
+"""
 
 import asyncio
 import ipaddress
 import json
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
@@ -39,9 +45,20 @@ RETRIEVAL_TOOLS: dict[str, tuple[type[BaseModel], str]] = {
     "fetch_webpage": (FetchArgs, "Read a public HTTP(S) webpage as text."),
 }
 
+# Tool names stay the same in mode "local"; the descriptions say what is really searched.
+LOCAL_DESCRIPTIONS: dict[str, str] = {
+    "google_search": "Search an offline snapshot of English Wikipedia; returns matching passages with "
+    "article titles and links.",
+    "google_lens_search": "Reverse image search over Wikipedia's images (offline) on an image_index; "
+    "defaults to Image 0. Returns the articles whose images look most similar.",
+    "fetch_webpage": "Read a Wikipedia article (offline) as text; other websites are not available.",
+}
+
 
 class RetrievalConfig(BaseModel):
-    mode: Literal["disabled", "live", "replay"] = "disabled"
+    mode: Literal["disabled", "live", "replay", "local"] = "disabled"
+    # mode "local": base URL of the offline Wikipedia retrieval service (wiki_retrieval/server.py)
+    retriever_url: str = ""
     serper_api_key: SecretStr = SecretStr("")
     imgbb_api_key: SecretStr = SecretStr("")
     jina_api_key: SecretStr = SecretStr("")
@@ -53,6 +70,8 @@ class RetrievalConfig(BaseModel):
     def validate_live(self) -> "RetrievalConfig":
         if self.mode == "live" and not self.serper_api_key.get_secret_value():
             raise ValueError("live retrieval requires serper_api_key")
+        if self.mode == "local" and not self.retriever_url.startswith(("http://", "https://")):
+            raise ValueError("local retrieval requires retriever_url (http://host:port)")
         if self.allow_image_upload and not self.imgbb_api_key.get_secret_value():
             raise ValueError("Lens image upload requires imgbb_api_key")
         return self
@@ -121,6 +140,8 @@ class Retrieval:
                 raise ValueError("retrieval replay mismatch; no live fallback is permitted")
             self.replay_position += 1
             return event["output"]
+        if self.config.mode == "local":
+            return await self._local(name, args, workspace)
         if isinstance(args, FetchArgs):
             headers = {"Accept": "text/plain"}
             if self.config.jina_api_key.get_secret_value():
@@ -158,6 +179,34 @@ class Retrieval:
         raw = await http_payload(
             self.config, "POST", "https://google.serper.dev/" + endpoint, headers=headers, json=payload
         )
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("retrieval provider returned an invalid JSON object")
+        return {"ok": True, "tool": name, "context": json.dumps(data, ensure_ascii=False)[:50000], "raw": data}
+
+    async def _local(self, name: str, args: BaseModel, workspace: ImageWorkspace) -> dict[str, Any]:
+        """Offline Wikipedia service; same result shapes as live mode."""
+        base = self.config.retriever_url.rstrip("/")
+        if isinstance(args, FetchArgs):
+            host = urlsplit(args.url).hostname or ""
+            if not (host == "wikipedia.org" or host.endswith(".wikipedia.org")):
+                raise ValueError("only Wikipedia articles are available in this offline environment")
+            try:
+                raw = await http_payload(self.config, "GET", f"{base}/page?url={quote(args.url, safe='')}")
+            except ValueError as e:
+                if "HTTP 404" in str(e):
+                    raise ValueError("no offline Wikipedia article for this URL") from None
+                raise
+            page = json.loads(raw)
+            text = f"Title: {page['title']}\n\nURL Source: {page['url']}\n\nMarkdown Content:\n{page['text']}"
+            return {"ok": True, "tool": name, "url": args.url, "context": text[: args.max_chars]}
+        if isinstance(args, SearchArgs):
+            raw = await http_payload(self.config, "POST", f"{base}/search", json={"query": args.query, "k": 5})
+        else:
+            data_url = image_data_url(workspace.get(args.image_index))
+            raw = await http_payload(
+                self.config, "POST", f"{base}/lens", json={"image_b64": data_url.split(",", 1)[1], "k": 5}
+            )
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("retrieval provider returned an invalid JSON object")

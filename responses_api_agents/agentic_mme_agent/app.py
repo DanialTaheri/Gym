@@ -25,7 +25,12 @@ from nemo_gym.openai_utils import (
 )
 from nemo_gym.server_utils import get_response_json, raise_for_status
 from resources_servers.agentic_mme.app import AgenticMMEVerifyResponse
-from responses_api_agents.agentic_mme_agent.retrieval import RETRIEVAL_TOOLS, Retrieval, RetrievalConfig
+from responses_api_agents.agentic_mme_agent.retrieval import (
+    LOCAL_DESCRIPTIONS,
+    RETRIEVAL_TOOLS,
+    Retrieval,
+    RetrievalConfig,
+)
 from responses_api_agents.agentic_mme_agent.tools import IMAGE_TOOLS, ImageWorkspace, function_schema
 
 
@@ -59,7 +64,9 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
 
     def tool_schemas(self) -> list[dict[str, Any]]:
         tools = dict(IMAGE_TOOLS)
-        if self.config.retrieval.mode != "disabled":
+        if self.config.retrieval.mode == "local":
+            tools.update({n: (m, LOCAL_DESCRIPTIONS[n]) for n, (m, _) in RETRIEVAL_TOOLS.items()})
+        elif self.config.retrieval.mode != "disabled":
             tools.update(RETRIEVAL_TOOLS)
         return [function_schema(name, model, description) for name, (model, description) in tools.items()]
 

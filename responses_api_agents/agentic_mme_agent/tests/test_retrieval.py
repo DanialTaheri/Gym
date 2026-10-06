@@ -161,3 +161,48 @@ async def test_http_bounds_and_release(monkeypatch, status, chunks, limit, error
         assert await http_payload(config, "GET", "https://example.com") == b"abcdef"
     response.release.assert_called_once()
     assert retrieval.request.call_args.kwargs["allow_redirects"] is False
+
+
+def test_local_requires_retriever_url() -> None:
+    with pytest.raises(ValidationError):
+        RetrievalConfig(mode="local")
+    assert RetrievalConfig(mode="local", retriever_url="http://node1:8100").retriever_url == "http://node1:8100"
+
+
+@pytest.mark.asyncio
+async def test_local_search_lens_and_fetch(workspace, monkeypatch) -> None:
+    http = AsyncMock()
+    monkeypatch.setattr(retrieval, "http_payload", http)
+    client = Retrieval(RetrievalConfig(mode="local", retriever_url="http://node1:8100/"))
+
+    http.return_value = b'{"organic":[{"title":"Giant panda","link":"https://en.wikipedia.org/wiki/Giant_panda"}]}'
+    result = await client.call("google_search", {"query": "giant panda habitat"}, workspace)
+    assert http.call_args.args[1:] == ("POST", "http://node1:8100/search")
+    assert http.call_args.kwargs["json"] == {"query": "giant panda habitat", "k": 5}
+    assert result["raw"]["organic"][0]["title"] == "Giant panda"
+
+    http.return_value = b'{"organic":[{"title":"Red","source":"Wikipedia","link":"https://en.wikipedia.org/wiki/Red"}]}'
+    result = await client.call("google_lens_search", {}, workspace)
+    assert http.call_args.args[1:] == ("POST", "http://node1:8100/lens")
+    assert http.call_args.kwargs["json"]["image_b64"]  # the image itself, no upload service
+    assert result["ok"]
+
+    http.return_value = b'{"title":"Giant panda","url":"https://en.wikipedia.org/wiki/Giant_panda","text":"' + b"x" * 50 + b'"}'
+    result = await client.call(
+        "fetch_webpage", {"url": "https://en.wikipedia.org/wiki/Giant_panda", "max_chars": 40}, workspace
+    )
+    assert http.call_args.args[2].startswith("http://node1:8100/page?url=https%3A%2F%2Fen.wikipedia.org")
+    assert result["context"].startswith("Title: Giant panda") and len(result["context"]) == 40
+
+
+@pytest.mark.asyncio
+async def test_local_fetch_refuses_other_sites_and_missing_articles(workspace, monkeypatch) -> None:
+    http = AsyncMock()
+    monkeypatch.setattr(retrieval, "http_payload", http)
+    client = Retrieval(RetrievalConfig(mode="local", retriever_url="http://node1:8100"))
+    with pytest.raises(ValueError, match="only Wikipedia"):
+        await client.call("fetch_webpage", {"url": "https://example.com/a"}, workspace)
+    http.assert_not_called()
+    http.side_effect = ValueError("retrieval provider returned HTTP 404")
+    with pytest.raises(ValueError, match="no offline Wikipedia article"):
+        await client.call("fetch_webpage", {"url": "https://en.wikipedia.org/wiki/Nope"}, workspace)
