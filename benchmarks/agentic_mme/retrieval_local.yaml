@@ -1,0 +1,10 @@
+# Overlay for benchmarks/agentic_mme/config.yaml: offline search instead of no search.
+#   config_paths: [benchmarks/agentic_mme/config.yaml, benchmarks/agentic_mme/retrieval_local.yaml]
+# google_search / google_lens_search / fetch_webpage go to an offline Wikipedia retrieval service
+# (E5 text + SigLIP image index); set wiki_retriever_url when it is not on the same node.
+agentic_mme_agent:
+  responses_api_agents:
+    agentic_mme_agent:
+      retrieval:
+        mode: local
+        retriever_url: ${oc.select:wiki_retriever_url,http://localhost:8100}
