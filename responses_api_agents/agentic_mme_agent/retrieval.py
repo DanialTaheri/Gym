@@ -12,6 +12,7 @@ service (E5 text index + SigLIP image index over Wikipedia) answers in Serper's 
 import asyncio
 import ipaddress
 import json
+import random
 from typing import Any, Literal
 from urllib.parse import quote, urlsplit
 
@@ -57,7 +58,8 @@ LOCAL_DESCRIPTIONS: dict[str, str] = {
 
 class RetrievalConfig(BaseModel):
     mode: Literal["disabled", "live", "replay", "local"] = "disabled"
-    # mode "local": base URL of the offline Wikipedia retrieval service (wiki_retrieval/server.py)
+    # mode "local": base URL of the offline Wikipedia retrieval service (wiki_retrieval/server.py);
+    # a comma-separated list spreads calls over several service replicas at random.
     retriever_url: str = ""
     serper_api_key: SecretStr = SecretStr("")
     imgbb_api_key: SecretStr = SecretStr("")
@@ -70,8 +72,10 @@ class RetrievalConfig(BaseModel):
     def validate_live(self) -> "RetrievalConfig":
         if self.mode == "live" and not self.serper_api_key.get_secret_value():
             raise ValueError("live retrieval requires serper_api_key")
-        if self.mode == "local" and not self.retriever_url.startswith(("http://", "https://")):
-            raise ValueError("local retrieval requires retriever_url (http://host:port)")
+        if self.mode == "local" and not all(
+            u.strip().startswith(("http://", "https://")) for u in self.retriever_url.split(",")
+        ):
+            raise ValueError("local retrieval requires retriever_url (http://host:port[,http://host2:port])")
         if self.allow_image_upload and not self.imgbb_api_key.get_secret_value():
             raise ValueError("Lens image upload requires imgbb_api_key")
         return self
@@ -186,7 +190,7 @@ class Retrieval:
 
     async def _local(self, name: str, args: BaseModel, workspace: ImageWorkspace) -> dict[str, Any]:
         """Offline Wikipedia service; same result shapes as live mode."""
-        base = self.config.retriever_url.rstrip("/")
+        base = random.choice([u.strip() for u in self.config.retriever_url.split(",")]).rstrip("/")
         if isinstance(args, FetchArgs):
             host = urlsplit(args.url).hostname or ""
             if not (host == "wikipedia.org" or host.endswith(".wikipedia.org")):

@@ -206,3 +206,15 @@ async def test_local_fetch_refuses_other_sites_and_missing_articles(workspace, m
     http.side_effect = ValueError("retrieval provider returned HTTP 404")
     with pytest.raises(ValueError, match="no offline Wikipedia article"):
         await client.call("fetch_webpage", {"url": "https://en.wikipedia.org/wiki/Nope"}, workspace)
+
+
+@pytest.mark.asyncio
+async def test_local_spreads_calls_over_replicas(workspace, monkeypatch) -> None:
+    http = AsyncMock(return_value=b'{"organic":[]}')
+    monkeypatch.setattr(retrieval, "http_payload", http)
+    client = Retrieval(RetrievalConfig(mode="local", retriever_url="http://a:8100, http://b:8100/"))
+    for _ in range(40):
+        await client.call("google_search", {"query": "q"}, workspace)
+    hosts = {call.args[2] for call in http.call_args_list}
+    assert hosts == {"http://a:8100/search", "http://b:8100/search"}
+
