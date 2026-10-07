@@ -785,7 +785,6 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 model,
                 {
                     "name": self.config.model,
-                    "interleaved": {"field": "reasoning"},
                     "limit": {"context": self.config.context_window, "output": self.config.max_output_tokens},
                     **(
                         {"attachment": True, "modalities": {"input": ["text", "image"], "output": ["text"]}}
