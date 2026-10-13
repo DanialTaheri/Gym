@@ -18,6 +18,7 @@ and written atomically (temp + os.replace), so many processes on many nodes can 
 Only provider responses are stored, never model-written text.
 """
 
+import glob
 import hashlib
 import json
 import os
@@ -29,7 +30,7 @@ from typing import Any
 
 from PIL import Image
 
-from responses_api_agents.agentic_mme_agent.sqlite_fuzzy_index import SqliteFuzzyIndex
+from responses_api_agents.agentic_mme_agent.sqlite_fuzzy_index import SqliteFuzzyIndex, build_master_db, master_db_path
 
 
 _WS_RE = re.compile(r"\s+")
@@ -172,3 +173,34 @@ class SearchCache:
 def shared_cache(root: str, fuzzy_threshold: float, write: bool) -> SearchCache:
     """One cache per (root, settings) per process: the fuzzy index's local tier is shared by all rollouts."""
     return SearchCache(root, fuzzy_threshold, write)
+
+
+def rebuild_index(root: str) -> int:
+    """Rebuild <root>/index/master.db from every cached search entry plus the per-process shards.
+
+    Run between evaluations (readers open master.db read-only and immutable); returns the norm count.
+    """
+    norms = set()
+    for path in glob.glob(os.path.join(root, "search", "*", "*", "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                norm = json.load(f).get("norm")
+        except (OSError, ValueError):
+            continue
+        if norm:
+            norms.add(norm)
+    for path in glob.glob(os.path.join(root, "index", "search_norms_*.txt")):
+        with open(path, encoding="utf-8") as f:
+            norms.update(line.strip() for line in f if line.strip())
+    target = master_db_path(root)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tmp = f"{target}.{os.getpid()}.new"
+    build_master_db(tmp, sorted(norms))
+    os.replace(tmp, target)
+    return len(norms)
+
+
+if __name__ == "__main__":
+    import sys
+
+    print(f"master.db: {rebuild_index(sys.argv[1])} query norms")

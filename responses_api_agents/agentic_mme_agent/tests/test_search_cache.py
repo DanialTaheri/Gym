@@ -70,3 +70,12 @@ async def test_miss_calls_provider_then_later_calls_hit_without_network(tmp_path
     page = await second.call("fetch_webpage", {"url": "https://a.example/p/", "max_chars": 100}, workspace)
     assert page["cache"] == "exact" and len(page["context"]) == 100  # the whole page was cached
     assert len(calls) == n  # no provider call for any hit
+
+
+def test_rebuild_index_makes_new_entries_fuzzy_matchable(tmp_path) -> None:
+    from responses_api_agents.agentic_mme_agent.search_cache import rebuild_index
+
+    _seed(tmp_path, "tallest building in Paris 2024", {"organic": []})
+    assert SearchCache(str(tmp_path), fuzzy_threshold=0.8).get_search("in Paris tallest building 2024")[1] == "miss"
+    assert rebuild_index(str(tmp_path)) == 1
+    assert SearchCache(str(tmp_path), fuzzy_threshold=0.8).get_search("in Paris tallest building 2024")[1] == "fuzzy"
