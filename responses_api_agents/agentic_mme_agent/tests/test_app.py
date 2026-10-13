@@ -263,7 +263,9 @@ async def test_wire_input_items_keep_their_type() -> None:
     # input item's type (function_call_output items have no role to infer it from).
     agent, _ = make_agent([response(output=[call()]), response("<answer>red</answer>")])
     await agent.run(request(), body())
-    model_calls = [c.kwargs for c in agent.server_client.post.call_args_list if c.kwargs["url_path"] == "/v1/responses"]
+    model_calls = [
+        c.kwargs for c in agent.server_client.post.call_args_list if c.kwargs["url_path"] == "/v1/responses"
+    ]
     wire = model_calls[1]["json"].model_dump(exclude_unset=True)["input"]
     assert [item.get("type") for item in wire[-2:]] == ["function_call_output", "message"]
     assert all(item.get("type") or item.get("role") for item in wire)

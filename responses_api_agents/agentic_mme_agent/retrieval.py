@@ -11,6 +11,12 @@ The web-search provider is configurable (search_provider):
 google_lens_search can use its own provider (lens_provider: serper | serpapi | none; default
 "auto" = the search provider when it has Lens, else none), e.g. Tavily text search with SerpAPI's
 Google Lens: search_provider=tavily, lens_provider=serpapi.
+
+cache_root (optional) puts a shared local cache in front of every live call (search_cache.py:
+flat files + FTS5 fuzzy index over earlier queries, Lens results keyed by image pixels, fetched
+pages keyed by URL). A hit is served without calling any provider; a miss calls the provider and,
+with cache_write, stores the answer for every later rollout. Tool outputs carry "cache":
+"exact" | "fuzzy" | "miss".
 fetch_webpage always reads pages through Jina Reader. Every provider's search answer is reduced
 to the same Serper-shaped object ({"organic": [{title, link, snippet}], ...}) so the model sees
 one format whatever the backend.
@@ -25,6 +31,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from nemo_gym.server_utils import request
+from responses_api_agents.agentic_mme_agent.search_cache import shared_cache
 from responses_api_agents.agentic_mme_agent.tools import ImageWorkspace, image_data_url
 
 
@@ -68,6 +75,10 @@ class RetrievalConfig(BaseModel):
     exa_api_key: SecretStr = SecretStr("")
     imgbb_api_key: SecretStr = SecretStr("")
     jina_api_key: SecretStr = SecretStr("")
+    # Local retrieval cache (see search_cache.py); "" disables it. Fuzzy threshold 0 = exact only.
+    cache_root: str = ""
+    cache_fuzzy_threshold: float = Field(default=0.8, ge=0, le=1)
+    cache_write: bool = True
     allow_image_upload: bool = False
     timeout_seconds: float = Field(default=30, gt=0, le=300)
     max_response_bytes: int = Field(default=2_000_000, gt=0, le=10_000_000)
@@ -215,17 +226,57 @@ class Retrieval:
                 raise ValueError("retrieval replay mismatch; no live fallback is permitted")
             self.replay_position += 1
             return event["output"]
+        cache = (
+            shared_cache(self.config.cache_root, self.config.cache_fuzzy_threshold, self.config.cache_write)
+            if self.config.cache_root
+            else None
+        )
+        if cache is not None:
+            hit, kind = await asyncio.to_thread(self._cache_lookup, cache, args, workspace)
+            if hit is not None:
+                if isinstance(args, FetchArgs):
+                    return {"ok": True, "tool": name, "url": args.url, "context": hit[: args.max_chars], "cache": kind}
+                return {
+                    "ok": True,
+                    "tool": name,
+                    "context": json.dumps(hit, ensure_ascii=False)[:50000],
+                    "raw": hit,
+                    "cache": kind,
+                }
+        out = await self._live(name, args, workspace)
+        if cache is not None:
+            await asyncio.to_thread(self._cache_store, cache, args, workspace, out)
+            out["cache"] = "miss"
+        return out
+
+    @staticmethod
+    def _cache_lookup(cache, args, workspace: ImageWorkspace) -> tuple[Any, str]:
+        if isinstance(args, SearchArgs):
+            return cache.get_search(args.query)
+        if isinstance(args, LensArgs):
+            hit = cache.get_lens(workspace.get(args.image_index))
+        else:
+            hit = cache.get_browse(args.url)
+        return hit, "exact" if hit is not None else "miss"
+
+    def _cache_store(self, cache, args, workspace: ImageWorkspace, out: dict[str, Any]) -> None:
+        if isinstance(args, FetchArgs):
+            cache.put_browse(args.url, out.get("full_text") or out["context"])
+        elif isinstance(args, SearchArgs):
+            cache.put_search(args.query, out["raw"], self.config.search_provider, args.gl, args.hl)
+        else:
+            cache.put_lens(workspace.get(args.image_index), out["raw"], self.config.lens_provider_resolved())
+        out.pop("full_text", None)
+
+    async def _live(self, name: str, args: BaseModel, workspace: ImageWorkspace) -> dict[str, Any]:
         if isinstance(args, FetchArgs):
             headers = {"Accept": "text/plain"}
             if self.config.jina_api_key.get_secret_value():
                 headers["Authorization"] = "Bearer " + self.config.jina_api_key.get_secret_value()
             raw = await http_payload(self.config, "GET", "https://r.jina.ai/" + args.url, headers=headers)
-            return {
-                "ok": True,
-                "tool": name,
-                "url": args.url,
-                "context": raw.decode("utf-8", errors="replace")[: args.max_chars],
-            }
+            text = raw.decode("utf-8", errors="replace")
+            # full_text (the whole page) is only for the cache; _cache_store drops it before returning.
+            return {"ok": True, "tool": name, "url": args.url, "context": text[: args.max_chars], "full_text": text}
         if isinstance(args, LensArgs) and not self.config.lens_available():
             raise ValueError(f"reverse image search is not available (lens_provider={self.config.lens_provider})")
         provider = self.config.lens_provider_resolved() if isinstance(args, LensArgs) else self.config.search_provider

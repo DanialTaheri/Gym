@@ -186,8 +186,12 @@ def test_provider_keys_are_required_per_provider() -> None:
 
 @pytest.mark.asyncio
 async def test_serpapi_search_maps_to_serper_shape_and_normalises_zh(workspace, monkeypatch) -> None:
-    http = _fake_request({"organic_results": [{"title": "T", "link": "https://a.example", "snippet": "S"}],
-                          "knowledge_graph": {"title": "KG", "description": "D"}})
+    http = _fake_request(
+        {
+            "organic_results": [{"title": "T", "link": "https://a.example", "snippet": "S"}],
+            "knowledge_graph": {"title": "KG", "description": "D"},
+        }
+    )
     monkeypatch.setattr(retrieval, "request", http)
     client = Retrieval(RetrievalConfig(mode="live", search_provider="serpapi", serpapi_api_key="k"))
     out = await client.call("google_search", {"query": "q", "hl": "zh"}, workspace)
@@ -203,10 +207,16 @@ async def test_serpapi_search_maps_to_serper_shape_and_normalises_zh(workspace, 
 @pytest.mark.parametrize(
     "provider,payload,url",
     [
-        ("tavily", {"results": [{"title": "T", "url": "https://a.example", "content": "C" * 900}]},
-         "https://api.tavily.com/search"),
-        ("exa", {"results": [{"title": "T", "url": "https://a.example", "highlights": ["h1", "h2"]}]},
-         "https://api.exa.ai/search"),
+        (
+            "tavily",
+            {"results": [{"title": "T", "url": "https://a.example", "content": "C" * 900}]},
+            "https://api.tavily.com/search",
+        ),
+        (
+            "exa",
+            {"results": [{"title": "T", "url": "https://a.example", "highlights": ["h1", "h2"]}]},
+            "https://api.exa.ai/search",
+        ),
     ],
 )
 async def test_tavily_and_exa_search_map_to_serper_shape(workspace, monkeypatch, provider, payload, url) -> None:
@@ -226,8 +236,13 @@ async def test_tavily_search_with_serpapi_lens(workspace, monkeypatch) -> None:
     with pytest.raises(ValidationError):  # Lens through SerpAPI needs the SerpAPI key
         RetrievalConfig(mode="live", search_provider="tavily", tavily_api_key="t", lens_provider="serpapi")
     config = RetrievalConfig(
-        mode="live", search_provider="tavily", tavily_api_key="t", lens_provider="serpapi",
-        serpapi_api_key="s", imgbb_api_key="i", allow_image_upload=True,
+        mode="live",
+        search_provider="tavily",
+        tavily_api_key="t",
+        lens_provider="serpapi",
+        serpapi_api_key="s",
+        imgbb_api_key="i",
+        allow_image_upload=True,
     )
     assert config.lens_available()
     calls = []
@@ -247,5 +262,8 @@ async def test_tavily_search_with_serpapi_lens(workspace, monkeypatch) -> None:
     assert search["raw"]["organic"][0]["link"] == "https://t.example"
     assert lens["raw"]["organic"][0]["title"] == "M"
     assert [c[1] for c in calls] == [
-        "https://api.tavily.com/search", "https://api.imgbb.com/1/upload", "https://serpapi.com/search.json"]
+        "https://api.tavily.com/search",
+        "https://api.imgbb.com/1/upload",
+        "https://serpapi.com/search.json",
+    ]
     assert calls[0][2]["headers"]["Authorization"] == "Bearer t" and calls[2][2]["params"]["api_key"] == "s"
