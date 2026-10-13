@@ -219,3 +219,33 @@ async def test_tavily_and_exa_search_map_to_serper_shape(workspace, monkeypatch,
     assert http.call_args.args[:2] == ("POST", url)
     with pytest.raises(ValueError, match="reverse image search"):
         await client.call("google_lens_search", {"image_index": 0}, workspace)
+
+
+@pytest.mark.asyncio
+async def test_tavily_search_with_serpapi_lens(workspace, monkeypatch) -> None:
+    with pytest.raises(ValidationError):  # Lens through SerpAPI needs the SerpAPI key
+        RetrievalConfig(mode="live", search_provider="tavily", tavily_api_key="t", lens_provider="serpapi")
+    config = RetrievalConfig(
+        mode="live", search_provider="tavily", tavily_api_key="t", lens_provider="serpapi",
+        serpapi_api_key="s", imgbb_api_key="i", allow_image_upload=True,
+    )
+    assert config.lens_available()
+    calls = []
+
+    async def fake_payload(cfg, method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if "imgbb" in url:
+            return json.dumps({"success": True, "data": {"url": "https://i.ibb.co/x.png"}}).encode()
+        if "serpapi" in url:
+            return json.dumps({"visual_matches": [{"title": "M", "link": "https://m.example"}]}).encode()
+        return json.dumps({"results": [{"title": "T", "url": "https://t.example", "content": "c"}]}).encode()
+
+    monkeypatch.setattr(retrieval, "http_payload", fake_payload)
+    client = Retrieval(config)
+    search = await client.call("google_search", {"query": "q"}, workspace)
+    lens = await client.call("google_lens_search", {"image_index": 0}, workspace)
+    assert search["raw"]["organic"][0]["link"] == "https://t.example"
+    assert lens["raw"]["organic"][0]["title"] == "M"
+    assert [c[1] for c in calls] == [
+        "https://api.tavily.com/search", "https://api.imgbb.com/1/upload", "https://serpapi.com/search.json"]
+    assert calls[0][2]["headers"]["Authorization"] == "Bearer t" and calls[2][2]["params"]["api_key"] == "s"

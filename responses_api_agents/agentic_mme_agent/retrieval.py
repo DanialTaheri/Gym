@@ -8,6 +8,9 @@ The web-search provider is configurable (search_provider):
     serpapi  serpapi.com (engine=google / google_lens), answers mapped to Serper's shape
     tavily   api.tavily.com/search        google_search only (no reverse image search)
     exa      api.exa.ai/search            google_search only (no reverse image search)
+google_lens_search can use its own provider (lens_provider: serper | serpapi | none; default
+"auto" = the search provider when it has Lens, else none), e.g. Tavily text search with SerpAPI's
+Google Lens: search_provider=tavily, lens_provider=serpapi.
 fetch_webpage always reads pages through Jina Reader. Every provider's search answer is reduced
 to the same Serper-shaped object ({"organic": [{title, link, snippet}], ...}) so the model sees
 one format whatever the backend.
@@ -58,6 +61,7 @@ LENS_PROVIDERS = ("serper", "serpapi")
 class RetrievalConfig(BaseModel):
     mode: Literal["disabled", "live", "replay"] = "disabled"
     search_provider: Literal["serper", "serpapi", "tavily", "exa"] = "serper"
+    lens_provider: Literal["auto", "serper", "serpapi", "none"] = "auto"
     serper_api_key: SecretStr = SecretStr("")
     serpapi_api_key: SecretStr = SecretStr("")
     tavily_api_key: SecretStr = SecretStr("")
@@ -74,15 +78,23 @@ class RetrievalConfig(BaseModel):
             raise ValueError(
                 f"live retrieval with search_provider={self.search_provider} requires {self.search_provider}_api_key"
             )
+        lens = self.lens_provider_resolved()
+        if self.mode == "live" and lens != "none" and not self.provider_key(lens):
+            raise ValueError(f"google_lens_search with lens_provider={lens} requires {lens}_api_key")
         if self.allow_image_upload and not self.imgbb_api_key.get_secret_value():
             raise ValueError("Lens image upload requires imgbb_api_key")
         return self
 
-    def provider_key(self) -> str:
-        return getattr(self, f"{self.search_provider}_api_key").get_secret_value()
+    def provider_key(self, provider: str | None = None) -> str:
+        return getattr(self, f"{provider or self.search_provider}_api_key").get_secret_value()
+
+    def lens_provider_resolved(self) -> str:
+        if self.lens_provider == "auto":
+            return self.search_provider if self.search_provider in LENS_PROVIDERS else "none"
+        return self.lens_provider
 
     def lens_available(self) -> bool:
-        return self.search_provider in LENS_PROVIDERS
+        return self.lens_provider_resolved() != "none"
 
 
 def public_url(url: str) -> str:
@@ -214,7 +226,10 @@ class Retrieval:
                 "url": args.url,
                 "context": raw.decode("utf-8", errors="replace")[: args.max_chars],
             }
-        provider, key = self.config.search_provider, self.config.provider_key()
+        if isinstance(args, LensArgs) and not self.config.lens_available():
+            raise ValueError(f"reverse image search is not available (lens_provider={self.config.lens_provider})")
+        provider = self.config.lens_provider_resolved() if isinstance(args, LensArgs) else self.config.search_provider
+        key = self.config.provider_key(provider)
         if isinstance(args, SearchArgs) and provider in ("tavily", "exa"):
             if provider == "tavily":
                 raw = await http_payload(
@@ -235,8 +250,6 @@ class Retrieval:
                 )
                 data = snippets_to_serper(json.loads(raw).get("results"), "highlights")
             return {"ok": True, "tool": name, "context": json.dumps(data, ensure_ascii=False)[:50000], "raw": data}
-        if isinstance(args, LensArgs) and not self.config.lens_available():
-            raise ValueError(f"reverse image search is not available with search_provider={provider}")
         headers = {"X-API-KEY": key}
         if isinstance(args, SearchArgs):
             payload = {"q": args.query, "gl": args.gl, "hl": args.hl, "num": 5}
