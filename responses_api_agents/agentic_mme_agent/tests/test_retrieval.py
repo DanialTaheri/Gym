@@ -161,3 +161,61 @@ async def test_http_bounds_and_release(monkeypatch, status, chunks, limit, error
         assert await http_payload(config, "GET", "https://example.com") == b"abcdef"
     response.release.assert_called_once()
     assert retrieval.request.call_args.kwargs["allow_redirects"] is False
+
+
+def _fake_request(payload):
+    """aiohttp-like response that streams `payload` and records the call."""
+    response = MagicMock()
+    response.status = 200
+    body = json.dumps(payload).encode()
+
+    async def chunks(_):
+        yield body
+
+    response.content.iter_chunked = chunks
+    return AsyncMock(return_value=response)
+
+
+def test_provider_keys_are_required_per_provider() -> None:
+    with pytest.raises(ValidationError):
+        RetrievalConfig(mode="live", search_provider="serpapi", serper_api_key="only-serper")
+    for provider in ("serper", "serpapi", "tavily", "exa"):
+        config = RetrievalConfig(mode="live", search_provider=provider, **{f"{provider}_api_key": "k"})
+        assert config.lens_available() == (provider in ("serper", "serpapi"))
+
+
+@pytest.mark.asyncio
+async def test_serpapi_search_maps_to_serper_shape_and_normalises_zh(workspace, monkeypatch) -> None:
+    http = _fake_request({"organic_results": [{"title": "T", "link": "https://a.example", "snippet": "S"}],
+                          "knowledge_graph": {"title": "KG", "description": "D"}})
+    monkeypatch.setattr(retrieval, "request", http)
+    client = Retrieval(RetrievalConfig(mode="live", search_provider="serpapi", serpapi_api_key="k"))
+    out = await client.call("google_search", {"query": "q", "hl": "zh"}, workspace)
+    assert out["raw"]["organic"] == [{"title": "T", "link": "https://a.example", "snippet": "S", "date": None}]
+    assert out["raw"]["knowledgeGraph"]["title"] == "KG"
+    method, url = http.call_args.args[:2]
+    params = http.call_args.kwargs["params"]
+    assert (method, url) == ("GET", "https://serpapi.com/search.json")
+    assert params["engine"] == "google" and params["hl"] == "zh-cn" and params["api_key"] == "k"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider,payload,url",
+    [
+        ("tavily", {"results": [{"title": "T", "url": "https://a.example", "content": "C" * 900}]},
+         "https://api.tavily.com/search"),
+        ("exa", {"results": [{"title": "T", "url": "https://a.example", "highlights": ["h1", "h2"]}]},
+         "https://api.exa.ai/search"),
+    ],
+)
+async def test_tavily_and_exa_search_map_to_serper_shape(workspace, monkeypatch, provider, payload, url) -> None:
+    http = _fake_request(payload)
+    monkeypatch.setattr(retrieval, "request", http)
+    client = Retrieval(RetrievalConfig(mode="live", search_provider=provider, **{f"{provider}_api_key": "k"}))
+    out = await client.call("google_search", {"query": "q"}, workspace)
+    hit = out["raw"]["organic"][0]
+    assert hit["title"] == "T" and hit["link"] == "https://a.example" and 0 < len(hit["snippet"]) <= 600
+    assert http.call_args.args[:2] == ("POST", url)
+    with pytest.raises(ValueError, match="reverse image search"):
+        await client.call("google_lens_search", {"image_index": 0}, workspace)
