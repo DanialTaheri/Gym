@@ -5,7 +5,8 @@
 # provider responses before calling the provider, and write misses back. Search hits are exact
 # (normalised query) or fuzzy (token_sort_ratio >= cache_fuzzy_threshold over the FTS5 index at
 # <cache_root>/index/master.db, rejected when the queries' numbers differ). Set cache_write: false
-# to only read. Rebuild master.db from new entries with search-e2e-frakstein's build_cache_index.py.
+# to only read. Rebuild master.db between runs:
+# python -m responses_api_agents.agentic_mme_agent.search_cache <cache dir>
 agentic_mme_agent:
   responses_api_agents:
     agentic_mme_agent:

@@ -140,8 +140,9 @@ before calling the provider (`AGENTIC_MME_SEARCH_CACHE=<dir>`):
 - Each retrieval output carries `"cache": "exact" | "fuzzy" | "miss"`, so a run's
   provider usage is the count of `miss` entries in `tool_trace`.
 
-The layout (`search/`, `lens/`, `browse/` of `<sha256>.json`, `index/master.db`) and
-`sqlite_fuzzy_index.py` are shared with search-e2e-frakstein's search cache.
+Layout: `search/`, `lens/`, `browse/` hold `<ab>/<cd>/<sha256(key)>.json` entries;
+`index/master.db` is the FTS5 index. Everything (cache, fuzzy index, rebuild) lives in
+`responses_api_agents/agentic_mme_agent/` and needs only `rapidfuzz` beyond the stdlib.
 
 Live model/provider smoke testing and baselining are required before marking
 verified=true. Unit tests are not evidence of benchmark performance.

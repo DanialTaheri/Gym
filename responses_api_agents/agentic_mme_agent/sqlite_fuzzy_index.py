@@ -14,8 +14,8 @@
 # limitations under the License.
 """FTS5 candidate generation for the search-norms fuzzy index.
 
-Copied unchanged from search-e2e-frakstein gym/resources_servers/browsecomp_advanced_harness/
-sqlite_fuzzy_index.py; search_cache.py (this package) is its caller here.
+Self-contained (stdlib sqlite3 + rapidfuzz); search_cache.py in this package is its caller and
+builds master.db with build_master_db (python -m responses_api_agents.agentic_mme_agent.search_cache <dir>).
 
 Replaces the brute-force `rapidfuzz.extractOne` over an in-memory list of every
 cached norm. That scan was O(n) per MISS, single-threaded, and GIL-held: at

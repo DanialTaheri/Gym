@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared, persistent cache of retrieval results: flat files + a read-only FTS5 fuzzy index.
 
-Same layout and normalisation as search-e2e-frakstein's browsecomp_advanced_harness/search_cache.py,
-so its build_cache_index.py (re)builds the index of a cache written here:
+Layout (no external tooling; `python -m responses_api_agents.agentic_mme_agent.search_cache <root>` rebuilds the index):
 
     <root>/search/<ab>/<cd>/<sha256(norm query)>.json  {"query","norm","provider","results": Serper-shaped dict, ...}
     <root>/lens/<ab>/<cd>/<sha256(pixel key)>.json      {"image_key","provider","results", ...}
     <root>/browse/<ab>/<cd>/<sha256(norm url)>.json     {"url","norm","provider","content", ...}
     <root>/index/master.db                              FTS5 over every cached query norm (read-only here)
-    <root>/index/search_norms_<host>_<pid>.txt          this process's new norms (merged by the builder)
+    <root>/index/search_norms_<host>_<pid>.txt          this process's new norms (merged by rebuild_index)
 
 Lookups: search = exact norm, then fuzzy (token_sort_ratio >= threshold over FTS5 candidates, see
 sqlite_fuzzy_index.py) unless the candidate's numbers differ from the query's (2010 vs 2020);
