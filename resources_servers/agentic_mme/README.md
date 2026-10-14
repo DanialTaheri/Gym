@@ -121,6 +121,9 @@ environment):
 | retrieval_tavily_serpapi_lens.yaml | Tavily | SerpAPI | TAVILY_API_KEY, SERPAPI_API_KEY, IMGBB_API_KEY |
 | retrieval_exa_serpapi_lens.yaml | Exa | SerpAPI | EXA_API_KEY, SERPAPI_API_KEY, IMGBB_API_KEY |
 
+Every overlay also passes `JINA_API_KEY` (if set) to fetch_webpage's Jina Reader. Anonymous
+Jina is rate-limited per IP; under search-heavy runs it answers HTTP 401, so set the key there.
+
 Add `retrieval_cache.yaml` after one of them to answer from a shared on-disk cache
 before calling the provider (`AGENTIC_MME_SEARCH_CACHE=<dir>`):
 
