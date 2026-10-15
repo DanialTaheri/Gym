@@ -17,6 +17,7 @@ and written atomically (temp + os.replace), so many processes on many nodes can 
 Only provider responses are stored, never model-written text.
 """
 
+import contextlib
 import glob
 import hashlib
 import json
@@ -54,6 +55,25 @@ def pixel_key(image: Image.Image) -> str:
     return hashlib.sha256(f"{rgb.size}".encode() + rgb.tobytes()).hexdigest()
 
 
+# Shared caches are written by processes with different uids and umasks (e.g. root in a container,
+# squashed to nobody on Lustre); entries must stay readable and directories writable for the others.
+_DIR_MODE = 0o2775
+_FILE_MODE = 0o664
+
+
+def _makedirs_shared(path: str) -> None:
+    missing = []
+    while path and not os.path.isdir(path):
+        missing.append(path)
+        path = os.path.dirname(path)
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory)
+        except FileExistsError:
+            continue
+        os.chmod(directory, _DIR_MODE)
+
+
 def _numbers(norm: str) -> set[str]:
     return set(_NUM_RE.findall(norm))
 
@@ -83,11 +103,18 @@ class SearchCache:
         if not self.write:
             return
         path = self._path(kind, key)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        try:
+            _makedirs_shared(os.path.dirname(path))
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.chmod(tmp, _FILE_MODE)
+            os.replace(tmp, path)
+        except OSError:
+            # Best effort: an unwritable shard of a shared cache must not turn a paid provider
+            # answer into a tool error.
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
 
     # ---- search -------------------------------------------------------------------------------
     def get_search(self, query: str) -> tuple[dict[str, Any] | None, str]:
@@ -124,10 +151,11 @@ class SearchCache:
             },
         )
         if self.fuzzy is not None and self.fuzzy.add(norm):
-            with self._lock:  # durable record for the next index build
-                os.makedirs(os.path.dirname(self._shard), exist_ok=True)
+            with self._lock, contextlib.suppress(OSError):  # durable record for the next index build
+                _makedirs_shared(os.path.dirname(self._shard))
                 with open(self._shard, "a", encoding="utf-8") as f:
                     f.write(norm + "\n")
+                os.chmod(self._shard, _FILE_MODE)
 
     # ---- lens / browse ------------------------------------------------------------------------
     def get_lens(self, image: Image.Image) -> dict[str, Any] | None:
@@ -192,9 +220,10 @@ def rebuild_index(root: str) -> int:
         with open(path, encoding="utf-8") as f:
             norms.update(line.strip() for line in f if line.strip())
     target = master_db_path(root)
-    os.makedirs(os.path.dirname(target), exist_ok=True)
+    _makedirs_shared(os.path.dirname(target))
     tmp = f"{target}.{os.getpid()}.new"
     build_master_db(tmp, sorted(norms))
+    os.chmod(tmp, _FILE_MODE)
     os.replace(tmp, target)
     return len(norms)
 
