@@ -391,6 +391,20 @@ class TestEnv:
         assert provider["options"]["baseURL"] == "http://model/v1"
         assert provider["models"]["Qwen3.6-35B-A3B"]["limit"]["output"] == 131072
 
+    def test_model_server_provider_id(self) -> None:
+        agent = _make_agent(
+            model="nemotron_super_sft",
+            provider_id="sv35sft",
+            model_server=ModelServerRef(type="responses_api_models", name="policy_model"),
+        )
+        with patch.object(agent, "_resolve_model_base_url", return_value="http://model/v1"):
+            config = agent._build_opencode_config()
+
+        assert agent._effective_model() == "sv35sft/nemotron_super_sft"
+        assert set(config["provider"]) == {"sv35sft"}
+        assert config["provider"]["sv35sft"]["options"]["baseURL"] == "http://model/v1"
+        assert "nemotron_super_sft" in config["provider"]["sv35sft"]["models"]
+
 
 class TestRolloutObservability:
     def test_routes_model_server_without_mutating_config(self, tmp_path: Path) -> None:
