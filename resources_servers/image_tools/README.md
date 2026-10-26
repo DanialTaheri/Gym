@@ -83,8 +83,9 @@ Extraction and grading reuse `string_match`. Two optional row fields:
 | `extraction_mode` | `final_answer` | `boxed` (last `\boxed{}`), `final_answer` (last `Answer:` line, else last `\boxed{}`), `last_line`, or `full_response` |
 | `case_sensitive` | `false` | `true` compares the stripped strings exactly, with no normalization or partial credit |
 
-With the default `final_answer`, a bare reply such as `3` scores 0 as `answer_missing`; set
-`extraction_mode: last_line` for rows whose prompt asks for the answer only.
+With the default `final_answer`, a bare reply such as `3` scores 0 as `answer_missing`. Terminal
+rows should ask for `\boxed{}` and set `extraction_mode: boxed`; see
+[Building terminal rows](#building-terminal-rows).
 
 ## Tool families
 
@@ -136,6 +137,66 @@ not belong in Gym). Each row:
 ```
 
 The `stop` on `</tool_call>` is what makes the rollout end *at* the decision.
+
+### Building terminal rows
+
+`convert_sft_to_image_pivot.py` emits tool-call rows only. Terminal (`__answer__`) rows are
+built separately; follow these rules so their rewards are unambiguous.
+
+1. **Where to cut.** Take a trajectory whose next assistant turn is the final answer (no tool
+   call). The prefix is everything up to, and including, the last tool response before that
+   turn. Drop the demonstration's answer turn itself.
+2. **Gold answer.** Use the dataset's ground-truth answer, not the demonstration's text:
+   `"expected_action": {"name": "__answer__", "arguments": {"answer": "<gold>"}}`. It must be a
+   non-empty string, an int, or a finite float (anything else scores `expected_action_invalid`).
+   Keep only trajectories whose demonstrated answer matches the gold, so "answer here" is
+   actually the right decision.
+3. **Ask for `\boxed{}`, and grade only `\boxed{}`.** End the first user message with:
+
+   ```
+   Provide your final answer in \boxed{Answer} format.
+   ```
+
+   Replace any other format instruction in the question (for example "Answer with the number
+   only") with this sentence, so a row never asks for two formats. Set
+   `"extraction_mode": "boxed"` on the row. Only the last `\boxed{}` after the last `</think>`
+   is graded; a bare `3` or an `Answer: 3` line scores 0 (`answer_missing`). This matches the
+   image-tools GRPO rows, whose prompts use the same sentence with `extraction_mode: boxed`.
+4. **Case.** Leave `case_sensitive` unset (`false`) unless the answer is genuinely
+   case-sensitive. The default normalizes case, quotes, trailing punctuation, numbers and LaTeX.
+5. **Metadata.** Record provenance, e.g.
+   `{"source_id": "...", "turn_index": 7, "tool_name": "__answer__", "terminal_row": true}`.
+
+A terminal row:
+
+```json
+{
+  "agent_ref": {"type": "responses_api_agents", "name": "image_tools_pivot_agent"},
+  "responses_create_params": {
+    "input": [
+      {"role": "system", "content": "...image-tool system prompt..."},
+      {"role": "user", "content": [
+        {"type": "input_text", "text": "How many yellow blocks are used in the figure? Provide your final answer in \\boxed{Answer} format."},
+        {"type": "input_image", "image_url": "...", "detail": "auto"}
+      ]},
+      ...assistant tool call / tool response turns...
+    ],
+    "metadata": {"extra_body": "{\"stop\": [\"</tool_call>\"], \"include_stop_str_in_output\": true}"}
+  },
+  "expected_action": {"name": "__answer__", "arguments": {"answer": "2"}},
+  "extraction_mode": "boxed",
+  "metadata": {"source_id": "...", "turn_index": 3, "tool_name": "__answer__", "terminal_row": true}
+}
+```
+
+Before training, validate the rows against the task-data schema, with the config's dataset
+paths pointing at your files. A misspelled `extraction_mode` is reported as a row error (a
+warning in `train_preparation`; add `+task_data_validation=error` to make it fail):
+
+```bash
+gym dataset collate "+config_paths=[resources_servers/image_tools/configs/image_tools_pivot.yaml]" \
+    +output_dirpath=<output_dir> +mode=train_preparation
+```
 
 ## Gotchas
 
