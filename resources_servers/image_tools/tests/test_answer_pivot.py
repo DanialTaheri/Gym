@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from nemo_gym.openai_utils import NeMoGymResponseReasoningItem
 from nemo_gym.server_utils import ServerClient
 from resources_servers.image_tools.app import (
     FailureCode,
@@ -195,6 +196,7 @@ async def test_tool_call_rejected_even_with_correct_answer(server: ImageToolsPiv
     assert result.num_rollout_tool_calls == 1
     assert result.reward == 0.0
     assert result.failure_reason == FailureCode.TOOL_CALL_WHEN_ANSWER_EXPECTED
+    assert result.rollout_tool_name == "image_rotate_tool"
 
 
 @pytest.mark.asyncio
@@ -210,3 +212,33 @@ async def test_agent_schema_preserves_answer_options(server: ImageToolsPivotReso
 def test_invalid_extraction_mode_is_rejected() -> None:
     with pytest.raises(ValidationError, match="extraction_mode"):
         make_request("4", extraction_mode="unsupported")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text,incomplete",
+    [
+        ("<think>Count the dots.\nAnswer: 4\nWait, check", False),
+        ("Count the dots.\nAnswer: 4\nWait, check", True),
+        (r"<think>a</think>\boxed{1} <think>maybe \boxed{4}", False),
+    ],
+)
+async def test_unclosed_reasoning_is_not_an_answer(
+    server: ImageToolsPivotResourcesServer, text: str, incomplete: bool
+) -> None:
+    body = make_request(text)
+    if incomplete:
+        body.response.incomplete_details = {"reason": "max_output_tokens"}
+    result = await server.verify(body)
+    assert result.reward == 0.0
+    assert result.failure_reason == FailureCode.ANSWER_MISSING
+
+
+@pytest.mark.asyncio
+async def test_answer_after_split_reasoning_survives_truncation(server: ImageToolsPivotResourcesServer) -> None:
+    # The model server moved the closed reasoning into a reasoning item; the cut came after the answer.
+    body = make_request("Answer: 4\nLet me also explain the")
+    body.response.output.insert(0, NeMoGymResponseReasoningItem(id="rs", summary=[]))
+    body.response.incomplete_details = {"reason": "max_output_tokens"}
+    result = await server.verify(body)
+    assert result.reward == 1.0

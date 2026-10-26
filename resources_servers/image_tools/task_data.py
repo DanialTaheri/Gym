@@ -22,7 +22,7 @@ Quirk: ``responses_create_params.metadata.extra_body`` is a JSON-encoded string 
 ('{"stop": ["</tool_call>"], ...}'), but that lives under a framework key and is not typed here.
 """
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -41,10 +41,27 @@ class TaskData(BaseModel):
     expected_action: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
-            "Gold tool call {name: str, arguments: dict|JSON-str}. Primary source for "
+            "Gold tool call {name: str, arguments: dict|JSON-str}, or a terminal answer "
+            "{name: __answer__, arguments: {answer: non-empty str|int|finite float}}. Primary source for "
             "extract_expected_action; arguments shape is per-tool-family (six families), e.g. "
             "bbox rows carry {bbox_2d: list[int], img_idx: int, label: str, factor?: int} where "
             "label/labels/factor are ignored by argument scoring."
+        ),
+        json_schema_extra={"consumed_by": ["verify"]},
+    )
+    extraction_mode: Literal["boxed", "final_answer", "last_line", "full_response"] = Field(
+        default="final_answer",
+        description=(
+            "Terminal (__answer__) rows only: how the answer is extracted from the text after the last "
+            "</think>, using string_match's extraction modes."
+        ),
+        json_schema_extra={"consumed_by": ["verify"]},
+    )
+    case_sensitive: bool = Field(
+        default=False,
+        description=(
+            "Terminal (__answer__) rows only: true compares the stripped strings exactly, skipping "
+            "string_match's normalization."
         ),
         json_schema_extra={"consumed_by": ["verify"]},
     )

@@ -503,15 +503,20 @@ class ImageToolsPivotResourcesServer(SimpleResourcesServer):
                     state["failure_reason"] = FailureCode.EXPECTED_ACTION_INVALID
                     return self._build(body, state)
                 gold = str(gold)
-                state["expected_answer_text"] = gold
                 if rollout_calls:
                     state["reward"] = 0.0
                     state["failure_reason"] = FailureCode.TOOL_CALL_WHEN_ANSWER_EXPECTED
+                    state["rollout_tool_name"] = str(rollout_calls[0].get("name", ""))
                     state["model_output"] = f"{rollout_calls[0].get('name')}(...)"
                     return self._build(body, state)
                 # Keep reasoning out of the final answer, while using the same
                 # extraction modes and grading as the answer-based environment.
+                # Reasoning still open after the last </think>, or a generation cut off
+                # at the token limit whose reasoning was never closed, holds no answer.
                 tail = text.rsplit("</think>", 1)[-1]
+                split = any(getattr(item, "type", None) == "reasoning" for item in body.response.output)
+                if "<think>" in tail or ("</think>" not in text and not split and body.response.incomplete_details):
+                    tail = ""
                 got = _extract_answer(tail, body.extraction_mode)
                 state["model_output"] = got if got is not None else text[-300:]
                 if got is None or not got.strip():

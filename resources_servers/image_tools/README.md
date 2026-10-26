@@ -6,9 +6,10 @@ against the action demonstrated at that turn in an SFT trajectory.
 ## What a pivot is
 
 One row = one decision point. The trajectory prefix is replayed verbatim
-(teacher-forced) and the model emits **one** image-tool call. No tool is executed
-and there is no final answer, so this is not outcome-reward RL — the reward is
-"did you choose the action the demonstration chose".
+(teacher-forced) and the model makes **one** decision: one image-tool call, or,
+on a terminal row, the final answer. No tool is executed. The reward is "did you
+choose the action the demonstration chose"; on a terminal row that means
+answering instead of calling a tool, with the right answer.
 
 Pair it with `tool_simulation_agent` (`max_steps: 1`): one model call, straight to
 `/verify`.
@@ -54,6 +55,36 @@ distinct. Set `unify_region_inspect_tools: false` to require exact tool names.
 
 Each verify response records `rollout_tool_name` and `expected_tool_name`, so tool
 selection errors can be read as a confusion matrix rather than one aggregate count.
+
+## Terminal (answer) pivots
+
+A row whose expected action is the sentinel `__answer__` marks a turn where the demonstration
+answered instead of calling another tool:
+
+```json
+"expected_action": {"name": "__answer__", "arguments": {"answer": "3"}}
+```
+
+| rollout | reward | `failure_reason` |
+| ------- | ------ | ---------------- |
+| contains an image-tool call (even with the right answer in the text) | 0 | `tool_call_when_answer_expected` |
+| no answer found after the last `</think>` | 0 | `answer_missing` |
+| wrong answer | 0 | `answer_incorrect` |
+| right answer | 1.0, or `string_match` partial credit (0.98 for a number within about 1%) | `none` |
+| gold missing, `null`, empty, boolean, list/dict, NaN or inf | 0 | `expected_action_invalid` |
+
+Reasoning that is still open after the last `</think>`, or a generation cut off at the token
+limit whose reasoning never closed, counts as no answer (`answer_missing`).
+
+Extraction and grading reuse `string_match`. Two optional row fields:
+
+| field | default | meaning |
+| ----- | ------- | ------- |
+| `extraction_mode` | `final_answer` | `boxed` (last `\boxed{}`), `final_answer` (last `Answer:` line, else last `\boxed{}`), `last_line`, or `full_response` |
+| `case_sensitive` | `false` | `true` compares the stripped strings exactly, with no normalization or partial credit |
+
+With the default `final_answer`, a bare reply such as `3` scores 0 as `answer_missing`; set
+`extraction_mode: last_line` for rows whose prompt asks for the answer only.
 
 ## Tool families
 
