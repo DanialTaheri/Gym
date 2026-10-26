@@ -7,9 +7,7 @@ image_tools_simple_agent:
         name: policy_model
       # `license` is REQUIRED on train/validation datasets: DatasetConfig asserts
       # it, and without it pydantic falls through to BenchmarkDatasetConfig and
-      # the server is silently demoted to an "almost-server" that never starts
-      # (see resources_servers/image_tools/configs/image_tools_pivot.yaml for the
-      # same convention on the pivot agent).
+      # the server is silently demoted to an "almost-server" that never starts.
       datasets:
       - name: train
         type: train
