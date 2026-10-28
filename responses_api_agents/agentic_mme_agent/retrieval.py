@@ -17,9 +17,16 @@ flat files + FTS5 fuzzy index over earlier queries, Lens results keyed by image 
 pages keyed by URL). A hit is served without calling any provider; a miss calls the provider and,
 with cache_write, stores the answer for every later rollout. Tool outputs carry "cache":
 "exact" | "fuzzy" | "miss".
-fetch_webpage always reads pages through Jina Reader. Every provider's search answer is reduced
-to the same Serper-shaped object ({"organic": [{title, link, snippet}], ...}) so the model sees
-one format whatever the backend.
+fetch_webpage reads pages through Jina Reader (fetch_provider=jina, default) or Exa's /contents
+endpoint (fetch_provider=exa, so Exa alone serves text search and page reads). Every provider's
+search answer is reduced to the same Serper-shaped object ({"organic": [{title, link, snippet}],
+...}) so the model sees one format whatever the backend.
+
+Benchmark-contamination guard (as in browsecomp_advanced_harness): a result that quotes the
+Agentic-MME benchmark itself (dataset mirror, repo, paper page) hands the model the answer key.
+Results matching contamination_patterns (case-insensitive substring over the whole serialized
+result) are dropped per item on every read, from the cache or live; the cache keeps the raw
+provider answer. A response with every item dropped, or a contaminated page, is withheld.
 """
 
 import asyncio
@@ -47,10 +54,13 @@ class LensArgs(BaseModel):
     image_index: int = Field(default=0, ge=0)
 
 
+MAX_FETCH_CHARS = 50000
+
+
 class FetchArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     url: str = Field(min_length=1, max_length=4096)
-    max_chars: int = Field(default=12000, ge=1, le=50000)
+    max_chars: int = Field(default=12000, ge=1, le=MAX_FETCH_CHARS)
 
 
 RETRIEVAL_TOOLS: dict[str, tuple[type[BaseModel], str]] = {
@@ -61,6 +71,10 @@ RETRIEVAL_TOOLS: dict[str, tuple[type[BaseModel], str]] = {
 
 
 SEARCH_PROVIDERS = ("serper", "serpapi", "tavily", "exa")
+# Spellings of the benchmark, its Hugging Face dataset (Crystal1047/Agentic-MME), and its GitHub
+# repo (ChoS3nE11ven/Agentic-MME). "agentic-mme" etc. also cover the org-prefixed forms.
+CONTAMINATION_PATTERNS = ("agentic-mme", "agentic_mme", "agentic mme", "agenticmme", "crystal1047", "chos3ne11ven")
+CONTAMINATED_MESSAGE = "Results withheld: every result referenced the benchmark itself."
 # Providers that can answer google_lens_search (reverse image search through Google Lens).
 LENS_PROVIDERS = ("serper", "serpapi")
 
@@ -69,6 +83,9 @@ class RetrievalConfig(BaseModel):
     mode: Literal["disabled", "live", "replay"] = "disabled"
     search_provider: Literal["serper", "serpapi", "tavily", "exa"] = "serper"
     lens_provider: Literal["auto", "serper", "serpapi", "none"] = "auto"
+    fetch_provider: Literal["jina", "exa"] = "jina"
+    # Case-insensitive substrings; an empty list disables the contamination guard.
+    contamination_patterns: list[str] = Field(default_factory=lambda: list(CONTAMINATION_PATTERNS))
     serper_api_key: SecretStr = SecretStr("")
     serpapi_api_key: SecretStr = SecretStr("")
     tavily_api_key: SecretStr = SecretStr("")
@@ -92,6 +109,8 @@ class RetrievalConfig(BaseModel):
         lens = self.lens_provider_resolved()
         if self.mode == "live" and lens != "none" and not self.provider_key(lens):
             raise ValueError(f"google_lens_search with lens_provider={lens} requires {lens}_api_key")
+        if self.mode == "live" and self.fetch_provider == "exa" and not self.exa_api_key.get_secret_value():
+            raise ValueError("fetch_webpage with fetch_provider=exa requires exa_api_key")
         if self.allow_image_upload and not self.imgbb_api_key.get_secret_value():
             raise ValueError("Lens image upload requires imgbb_api_key")
         return self
@@ -216,6 +235,8 @@ class Retrieval:
         args = model.model_validate(arguments)
         if isinstance(args, FetchArgs):
             public_url(args.url)
+            if self._contaminated(args.url):  # no provider call for a benchmark URL
+                return {"ok": True, "tool": name, "url": args.url, "context": CONTAMINATED_MESSAGE, "contaminated": 1}
         if isinstance(args, LensArgs):
             workspace.get(args.image_index)
         if self.config.mode == "replay":
@@ -235,18 +256,64 @@ class Retrieval:
             hit, kind = await asyncio.to_thread(self._cache_lookup, cache, args, workspace)
             if hit is not None:
                 if isinstance(args, FetchArgs):
-                    return {"ok": True, "tool": name, "url": args.url, "context": hit[: args.max_chars], "cache": kind}
-                return {
-                    "ok": True,
-                    "tool": name,
-                    "context": json.dumps(hit, ensure_ascii=False)[:50000],
-                    "raw": hit,
-                    "cache": kind,
-                }
+                    out = {
+                        "ok": True,
+                        "tool": name,
+                        "url": args.url,
+                        "context": hit[: args.max_chars],
+                        "full_text": hit,
+                    }
+                else:
+                    out = {"ok": True, "tool": name, "context": "", "raw": hit}
+                out["cache"] = kind
+                return self._decontaminate(out)
         out = await self._live(name, args, workspace)
         if cache is not None:
             await asyncio.to_thread(self._cache_store, cache, args, workspace, out)
             out["cache"] = "miss"
+        return self._decontaminate(out)
+
+    def _contaminated(self, value: Any) -> bool:
+        patterns = self.config.contamination_patterns
+        if not patterns:
+            return False
+        hay = (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)).lower()
+        return any(p.lower() in hay for p in patterns)
+
+    def _decontaminate(self, out: dict[str, Any]) -> dict[str, Any]:
+        """Drop benchmark-quoting items (filter on read; the cache keeps the raw answer).
+
+        Search / Lens: per organic item, plus knowledgeGraph / answerBox. Page: the whole page.
+        "contaminated" counts the dropped items so the rate shows up in rollout traces.
+        """
+        if "url" in out:  # fetch_webpage
+            # full_text is cache-only (without a cache it used to reach the model); scan what the
+            # model would see.
+            out.pop("full_text", None)
+            if self._contaminated(out["context"]):
+                out["context"] = CONTAMINATED_MESSAGE
+                out["contaminated"] = 1
+            return out
+        raw = out["raw"]
+        dropped = 0
+        if isinstance(raw, dict):
+            raw = dict(raw)
+            organic = raw.get("organic")
+            if isinstance(organic, list):
+                kept = [item for item in organic if not self._contaminated(item)]
+                dropped += len(organic) - len(kept)
+                raw["organic"] = kept
+            for key in [k for k, v in raw.items() if k != "organic" and self._contaminated(v)]:
+                del raw[key]
+                dropped += 1
+        if dropped:
+            out["contaminated"] = dropped
+            if not any(raw.values()):
+                out["raw"] = {}
+                out["context"] = CONTAMINATED_MESSAGE
+                return out
+        out["raw"] = raw
+        out["context"] = json.dumps(raw, ensure_ascii=False)[:50000]
         return out
 
     @staticmethod
@@ -261,7 +328,7 @@ class Retrieval:
 
     def _cache_store(self, cache, args, workspace: ImageWorkspace, out: dict[str, Any]) -> None:
         if isinstance(args, FetchArgs):
-            cache.put_browse(args.url, out.get("full_text") or out["context"])
+            cache.put_browse(args.url, out.get("full_text") or out["context"], self.config.fetch_provider)
         elif isinstance(args, SearchArgs):
             cache.put_search(args.query, out["raw"], self.config.search_provider, args.gl, args.hl)
         else:
@@ -270,11 +337,26 @@ class Retrieval:
 
     async def _live(self, name: str, args: BaseModel, workspace: ImageWorkspace) -> dict[str, Any]:
         if isinstance(args, FetchArgs):
-            headers = {"Accept": "text/plain"}
-            if self.config.jina_api_key.get_secret_value():
-                headers["Authorization"] = "Bearer " + self.config.jina_api_key.get_secret_value()
-            raw = await http_payload(self.config, "GET", "https://r.jina.ai/" + args.url, headers=headers)
-            text = raw.decode("utf-8", errors="replace")
+            if self.config.fetch_provider == "exa":
+                # As browsecomp_advanced_harness: Exa /contents with a text cap. Fetch up to the
+                # tool's max_chars ceiling so the cached page serves any later max_chars.
+                raw = await http_payload(
+                    self.config,
+                    "POST",
+                    "https://api.exa.ai/contents",
+                    headers={"x-api-key": self.config.exa_api_key.get_secret_value()},
+                    json={"urls": [args.url], "text": {"maxCharacters": MAX_FETCH_CHARS}},
+                )
+                results = json.loads(raw).get("results") or []
+                text = (results[0].get("text") if results and isinstance(results[0], dict) else None) or ""
+                if not text.strip():
+                    raise ValueError("no page content available for this URL")
+            else:
+                headers = {"Accept": "text/plain"}
+                if self.config.jina_api_key.get_secret_value():
+                    headers["Authorization"] = "Bearer " + self.config.jina_api_key.get_secret_value()
+                raw = await http_payload(self.config, "GET", "https://r.jina.ai/" + args.url, headers=headers)
+                text = raw.decode("utf-8", errors="replace")
             # full_text (the whole page) is only for the cache; _cache_store drops it before returning.
             return {"ok": True, "tool": name, "url": args.url, "context": text[: args.max_chars], "full_text": text}
         if isinstance(args, LensArgs) and not self.config.lens_available():
