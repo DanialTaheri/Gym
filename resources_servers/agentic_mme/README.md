@@ -16,7 +16,7 @@ Sources:
 Image tools: crop, rotate, flip, resize, enhance, grayscale, autocontrast,
 blur, sharpen, denoise, edge_detect, invert, equalize, threshold.
 
-Retrieval: google_search (Serper), google_lens_search (Serper + ImgBB),
+Retrieval: google_search, google_lens_search (+ ImgBB upload; providers below),
 fetch_webpage (Jina Reader). The paper describes download_image, but the released
 atomic harness disables it; this integration likewise does not expose it.
 Free-form Python/Gen mode is not implemented.
@@ -103,6 +103,49 @@ For deterministic offline retrieval, set retrieval.mode=replay and put an ordere
 retrieval_replay list on each input row; entries contain tool_name, arguments and
 output from a previous tool_trace. Replay must match tool and normalized arguments.
 Mismatches fail visibly and never fall back to the network.
+
+### Web search providers and shared cache
+
+`retrieval.search_provider` picks the text-search backend (`serper`, `serpapi`,
+`tavily`, `exa`); `retrieval.lens_provider` picks Google Lens (`serper`, `serpapi`,
+`none`; `auto` follows the search provider when it has Lens). Every result is
+normalised to the Serper shape, so the model sees the same tool output either way.
+Ready-made overlays for `benchmarks/agentic_mme/config.yaml` (keys come from the
+environment):
+
+| overlay | text search | Lens | keys |
+|---|---|---|---|
+| retrieval_serpapi.yaml | SerpAPI | SerpAPI | SERPAPI_API_KEY, IMGBB_API_KEY |
+| retrieval_tavily.yaml | Tavily | none | TAVILY_API_KEY |
+| retrieval_exa.yaml | Exa | none | EXA_API_KEY |
+| retrieval_tavily_serpapi_lens.yaml | Tavily | SerpAPI | TAVILY_API_KEY, SERPAPI_API_KEY, IMGBB_API_KEY |
+| retrieval_exa_serpapi_lens.yaml | Exa | SerpAPI | EXA_API_KEY, SERPAPI_API_KEY, IMGBB_API_KEY |
+
+Every overlay also passes `JINA_API_KEY` (if set) to fetch_webpage's Jina Reader. Anonymous
+Jina is rate-limited per IP; under search-heavy runs it answers HTTP 401, so set the key there.
+
+Add `retrieval_cache.yaml` after one of them to answer from a shared on-disk cache
+before calling the provider (`AGENTIC_MME_SEARCH_CACHE=<dir>`):
+
+    export AGENTIC_MME_SEARCH_CACHE=/shared/agentic_mme_search_cache TAVILY_API_KEY=... SERPAPI_API_KEY=... IMGBB_API_KEY=...
+    config_paths="benchmarks/agentic_mme/config.yaml,benchmarks/agentic_mme/retrieval_tavily_serpapi_lens.yaml,benchmarks/agentic_mme/retrieval_cache.yaml"
+    ng_prepare_benchmark "+config_paths=[$config_paths]"   # then run with the same config_paths
+
+- google_search: exact normalised query, else fuzzy match (`token_sort_ratio >=
+  cache_fuzzy_threshold`, default 0.8) over FTS5 candidates from
+  `<dir>/index/master.db`, rejected when the two queries contain different numbers.
+- google_lens_search: SHA-256 of the image pixels; fetch_webpage: normalised URL.
+- Misses go to the provider and are written back (`cache_write: false` to only read);
+  new query norms also go to `<dir>/index/search_norms_<host>_<pid>.txt`, and are
+  fuzzy-matchable in that process at once. To share them with other processes, rebuild
+  the index between runs: `python -m responses_api_agents.agentic_mme_agent.search_cache <dir>`. Files are content-addressed and written atomically, so many nodes
+  can share one directory.
+- Each retrieval output carries `"cache": "exact" | "fuzzy" | "miss"`, so a run's
+  provider usage is the count of `miss` entries in `tool_trace`.
+
+Layout: `search/`, `lens/`, `browse/` hold `<ab>/<cd>/<sha256(key)>.json` entries;
+`index/master.db` is the FTS5 index. Everything (cache, fuzzy index, rebuild) lives in
+`responses_api_agents/agentic_mme_agent/` and needs only `rapidfuzz` beyond the stdlib.
 
 Live model/provider smoke testing and baselining are required before marking
 verified=true. Unit tests are not evidence of benchmark performance.
