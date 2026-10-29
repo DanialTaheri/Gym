@@ -1,7 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded retrieval through Gym's shared aiohttp transport; explicit Lens upload opt-in."""
+"""Bounded retrieval through Gym's shared aiohttp transport; explicit Lens upload opt-in.
+
+The web-search provider is configurable (search_provider):
+    serper   google.serper.dev            google_search + google_lens_search (Google results)
+    serpapi  serpapi.com (engine=google / google_lens), answers mapped to Serper's shape
+    tavily   api.tavily.com/search        google_search only (no reverse image search)
+    exa      api.exa.ai/search            google_search only (no reverse image search)
+google_lens_search can use its own provider (lens_provider: serper | serpapi | none; default
+"auto" = the search provider when it has Lens, else none), e.g. Tavily text search with SerpAPI's
+Google Lens: search_provider=tavily, lens_provider=serpapi.
+
+cache_root (optional) puts a shared local cache in front of every live call (search_cache.py:
+flat files + FTS5 fuzzy index over earlier queries, Lens results keyed by image pixels, fetched
+pages keyed by URL). A hit is served without calling any provider; a miss calls the provider and,
+with cache_write, stores the answer for every later rollout. Tool outputs carry "cache":
+"exact" | "fuzzy" | "miss".
+fetch_webpage always reads pages through Jina Reader. Every provider's search answer is reduced
+to the same Serper-shaped object ({"organic": [{title, link, snippet}], ...}) so the model sees
+one format whatever the backend.
+"""
 
 import asyncio
 import ipaddress
@@ -12,6 +31,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from nemo_gym.server_utils import request
+from responses_api_agents.agentic_mme_agent.search_cache import shared_cache
 from responses_api_agents.agentic_mme_agent.tools import ImageWorkspace, image_data_url
 
 
@@ -40,22 +60,52 @@ RETRIEVAL_TOOLS: dict[str, tuple[type[BaseModel], str]] = {
 }
 
 
+SEARCH_PROVIDERS = ("serper", "serpapi", "tavily", "exa")
+# Providers that can answer google_lens_search (reverse image search through Google Lens).
+LENS_PROVIDERS = ("serper", "serpapi")
+
+
 class RetrievalConfig(BaseModel):
     mode: Literal["disabled", "live", "replay"] = "disabled"
+    search_provider: Literal["serper", "serpapi", "tavily", "exa"] = "serper"
+    lens_provider: Literal["auto", "serper", "serpapi", "none"] = "auto"
     serper_api_key: SecretStr = SecretStr("")
+    serpapi_api_key: SecretStr = SecretStr("")
+    tavily_api_key: SecretStr = SecretStr("")
+    exa_api_key: SecretStr = SecretStr("")
     imgbb_api_key: SecretStr = SecretStr("")
     jina_api_key: SecretStr = SecretStr("")
+    # Local retrieval cache (see search_cache.py); "" disables it. Fuzzy threshold 0 = exact only.
+    cache_root: str = ""
+    cache_fuzzy_threshold: float = Field(default=0.8, ge=0, le=1)
+    cache_write: bool = True
     allow_image_upload: bool = False
     timeout_seconds: float = Field(default=30, gt=0, le=300)
     max_response_bytes: int = Field(default=2_000_000, gt=0, le=10_000_000)
 
     @model_validator(mode="after")
     def validate_live(self) -> "RetrievalConfig":
-        if self.mode == "live" and not self.serper_api_key.get_secret_value():
-            raise ValueError("live retrieval requires serper_api_key")
+        if self.mode == "live" and not self.provider_key():
+            raise ValueError(
+                f"live retrieval with search_provider={self.search_provider} requires {self.search_provider}_api_key"
+            )
+        lens = self.lens_provider_resolved()
+        if self.mode == "live" and lens != "none" and not self.provider_key(lens):
+            raise ValueError(f"google_lens_search with lens_provider={lens} requires {lens}_api_key")
         if self.allow_image_upload and not self.imgbb_api_key.get_secret_value():
             raise ValueError("Lens image upload requires imgbb_api_key")
         return self
+
+    def provider_key(self, provider: str | None = None) -> str:
+        return getattr(self, f"{provider or self.search_provider}_api_key").get_secret_value()
+
+    def lens_provider_resolved(self) -> str:
+        if self.lens_provider == "auto":
+            return self.search_provider if self.search_provider in LENS_PROVIDERS else "none"
+        return self.lens_provider
+
+    def lens_available(self) -> bool:
+        return self.lens_provider_resolved() != "none"
 
 
 def public_url(url: str) -> str:
@@ -98,6 +148,61 @@ async def http_payload(config: RetrievalConfig, method: str, url: str, **kwargs:
             response.release()
 
 
+# Serper accepts a bare "zh"; SerpAPI rejects it (HTTP 400 "Unsupported `zh` interface language").
+_SERPAPI_HL = {"zh": "zh-cn", "zh-hans": "zh-cn", "zh-sg": "zh-cn", "zh-hant": "zh-tw", "zh-hk": "zh-tw"}
+
+
+def serpapi_to_serper(data: dict[str, Any], lens: bool) -> dict[str, Any]:
+    """SerpAPI google / google_lens answer -> Serper's shape (organic first, as Serper returns)."""
+    if lens:
+        return {
+            "organic": [
+                {
+                    "title": m.get("title"),
+                    "link": m.get("link"),
+                    "source": m.get("source"),
+                    "imageUrl": m.get("image"),
+                    "thumbnailUrl": m.get("thumbnail"),
+                }
+                for m in data.get("visual_matches") or []
+                if isinstance(m, dict)
+            ][:10]
+        }
+    out: dict[str, Any] = {
+        "organic": [
+            {"title": r.get("title"), "link": r.get("link"), "snippet": r.get("snippet"), "date": r.get("date")}
+            for r in data.get("organic_results") or []
+            if isinstance(r, dict)
+        ][:10]
+    }
+    kg = data.get("knowledge_graph")
+    if isinstance(kg, dict) and kg.get("title"):
+        out["knowledgeGraph"] = {k: kg.get(k) for k in ("title", "type", "description", "website")}
+    box = data.get("answer_box")
+    if isinstance(box, dict):
+        out["answerBox"] = {k: box.get(k) for k in ("title", "answer", "snippet", "link")}
+    return out
+
+
+def snippets_to_serper(results: list[Any], text_key: str, link_key: str = "url") -> dict[str, Any]:
+    """Tavily / Exa result list -> Serper's organic list (snippet capped at 600 characters)."""
+    organic = []
+    for r in results or []:
+        if isinstance(r, dict):
+            text = r.get(text_key)
+            if isinstance(text, list):  # Exa highlights
+                text = " ... ".join(str(t) for t in text)
+            organic.append(
+                {
+                    "title": r.get("title"),
+                    "link": r.get(link_key),
+                    "snippet": (str(text or "")[:600]),
+                    "date": r.get("publishedDate") or r.get("published_date"),
+                }
+            )
+    return {"organic": organic}
+
+
 class Retrieval:
     def __init__(self, config: RetrievalConfig, replay: list[dict[str, Any]] | None = None) -> None:
         self.config = config
@@ -121,18 +226,82 @@ class Retrieval:
                 raise ValueError("retrieval replay mismatch; no live fallback is permitted")
             self.replay_position += 1
             return event["output"]
+        cache = (
+            shared_cache(self.config.cache_root, self.config.cache_fuzzy_threshold, self.config.cache_write)
+            if self.config.cache_root
+            else None
+        )
+        if cache is not None:
+            hit, kind = await asyncio.to_thread(self._cache_lookup, cache, args, workspace)
+            if hit is not None:
+                if isinstance(args, FetchArgs):
+                    return {"ok": True, "tool": name, "url": args.url, "context": hit[: args.max_chars], "cache": kind}
+                return {
+                    "ok": True,
+                    "tool": name,
+                    "context": json.dumps(hit, ensure_ascii=False)[:50000],
+                    "raw": hit,
+                    "cache": kind,
+                }
+        out = await self._live(name, args, workspace)
+        if cache is not None:
+            await asyncio.to_thread(self._cache_store, cache, args, workspace, out)
+            out["cache"] = "miss"
+        return out
+
+    @staticmethod
+    def _cache_lookup(cache, args, workspace: ImageWorkspace) -> tuple[Any, str]:
+        if isinstance(args, SearchArgs):
+            return cache.get_search(args.query)
+        if isinstance(args, LensArgs):
+            hit = cache.get_lens(workspace.get(args.image_index))
+        else:
+            hit = cache.get_browse(args.url)
+        return hit, "exact" if hit is not None else "miss"
+
+    def _cache_store(self, cache, args, workspace: ImageWorkspace, out: dict[str, Any]) -> None:
+        if isinstance(args, FetchArgs):
+            cache.put_browse(args.url, out.get("full_text") or out["context"])
+        elif isinstance(args, SearchArgs):
+            cache.put_search(args.query, out["raw"], self.config.search_provider, args.gl, args.hl)
+        else:
+            cache.put_lens(workspace.get(args.image_index), out["raw"], self.config.lens_provider_resolved())
+        out.pop("full_text", None)
+
+    async def _live(self, name: str, args: BaseModel, workspace: ImageWorkspace) -> dict[str, Any]:
         if isinstance(args, FetchArgs):
             headers = {"Accept": "text/plain"}
             if self.config.jina_api_key.get_secret_value():
                 headers["Authorization"] = "Bearer " + self.config.jina_api_key.get_secret_value()
             raw = await http_payload(self.config, "GET", "https://r.jina.ai/" + args.url, headers=headers)
-            return {
-                "ok": True,
-                "tool": name,
-                "url": args.url,
-                "context": raw.decode("utf-8", errors="replace")[: args.max_chars],
-            }
-        headers = {"X-API-KEY": self.config.serper_api_key.get_secret_value()}
+            text = raw.decode("utf-8", errors="replace")
+            # full_text (the whole page) is only for the cache; _cache_store drops it before returning.
+            return {"ok": True, "tool": name, "url": args.url, "context": text[: args.max_chars], "full_text": text}
+        if isinstance(args, LensArgs) and not self.config.lens_available():
+            raise ValueError(f"reverse image search is not available (lens_provider={self.config.lens_provider})")
+        provider = self.config.lens_provider_resolved() if isinstance(args, LensArgs) else self.config.search_provider
+        key = self.config.provider_key(provider)
+        if isinstance(args, SearchArgs) and provider in ("tavily", "exa"):
+            if provider == "tavily":
+                raw = await http_payload(
+                    self.config,
+                    "POST",
+                    "https://api.tavily.com/search",
+                    headers={"Authorization": "Bearer " + key},
+                    json={"query": args.query, "max_results": 5, "search_depth": "basic"},
+                )
+                data = snippets_to_serper(json.loads(raw).get("results"), "content")
+            else:
+                raw = await http_payload(
+                    self.config,
+                    "POST",
+                    "https://api.exa.ai/search",
+                    headers={"x-api-key": key},
+                    json={"query": args.query, "numResults": 5, "contents": {"highlights": True}},
+                )
+                data = snippets_to_serper(json.loads(raw).get("results"), "highlights")
+            return {"ok": True, "tool": name, "context": json.dumps(data, ensure_ascii=False)[:50000], "raw": data}
+        headers = {"X-API-KEY": key}
         if isinstance(args, SearchArgs):
             payload = {"q": args.query, "gl": args.gl, "hl": args.hl, "num": 5}
             endpoint = "search"
@@ -155,10 +324,24 @@ class Retrieval:
                 raise ValueError("image upload did not return an image URL")
             payload = {"url": public_url(uploaded["data"]["url"]), "num": 5}
             endpoint = "lens"
-        raw = await http_payload(
-            self.config, "POST", "https://google.serper.dev/" + endpoint, headers=headers, json=payload
-        )
-        data = json.loads(raw)
+        if provider == "serpapi":
+            params = {"api_key": key, "num": "5"}
+            if endpoint == "search":
+                params |= {
+                    "engine": "google",
+                    "q": args.query,
+                    "gl": args.gl,
+                    "hl": _SERPAPI_HL.get(args.hl.lower(), args.hl),
+                }
+            else:
+                params |= {"engine": "google_lens", "url": payload["url"]}
+            raw = await http_payload(self.config, "GET", "https://serpapi.com/search.json", params=params)
+            data = serpapi_to_serper(json.loads(raw), lens=endpoint == "lens")
+        else:
+            raw = await http_payload(
+                self.config, "POST", "https://google.serper.dev/" + endpoint, headers=headers, json=payload
+            )
+            data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("retrieval provider returned an invalid JSON object")
         return {"ok": True, "tool": name, "context": json.dumps(data, ensure_ascii=False)[:50000], "raw": data}
