@@ -17,7 +17,7 @@ Image tools: crop, rotate, flip, resize, enhance, grayscale, autocontrast,
 blur, sharpen, denoise, edge_detect, invert, equalize, threshold.
 
 Retrieval: google_search, google_lens_search (+ ImgBB upload; providers below),
-fetch_webpage (Jina Reader). The paper describes download_image, but the released
+fetch_webpage (Jina Reader, or Exa /contents). The paper describes download_image, but the released
 atomic harness disables it; this integration likewise does not expose it.
 Free-form Python/Gen mode is not implemented.
 
@@ -123,6 +123,18 @@ environment):
 
 Every overlay also passes `JINA_API_KEY` (if set) to fetch_webpage's Jina Reader. Anonymous
 Jina is rate-limited per IP; under search-heavy runs it answers HTTP 401, so set the key there.
+With `retrieval.fetch_provider: exa` fetch_webpage reads pages through Exa's `/contents`
+endpoint instead (needs `exa_api_key`; no Jina), so Exa alone serves text search and pages.
+Exa returns pages from its index, so a URL it has not crawled comes back as a tool error.
+
+Benchmark-contamination guard (on by default): a result quoting Agentic-MME itself (its
+dataset, repo or papers about it) would hand the model the answer key. Search and Lens items
+matching `retrieval.contamination_patterns` (case-insensitive substrings over the whole item:
+the `agentic-mme` spellings, `crystal1047`, `chos3ne11ven`) are dropped one by one; a response
+left empty, a page that mentions the benchmark, or a fetch of a benchmark URL returns "Results
+withheld: every result referenced the benchmark itself." Filtering happens on every read, live
+or cached, and the cache keeps the raw answer. Outputs carry `"contaminated": <n dropped>`.
+`contamination_patterns: []` disables the guard.
 
 Add `retrieval_cache.yaml` after one of them to answer from a shared on-disk cache
 before calling the provider (`AGENTIC_MME_SEARCH_CACHE=<dir>`):

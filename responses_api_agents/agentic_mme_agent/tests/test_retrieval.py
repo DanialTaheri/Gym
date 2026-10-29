@@ -267,3 +267,69 @@ async def test_tavily_search_with_serpapi_lens(workspace, monkeypatch) -> None:
         "https://serpapi.com/search.json",
     ]
     assert calls[0][2]["headers"]["Authorization"] == "Bearer t" and calls[2][2]["params"]["api_key"] == "s"
+
+
+@pytest.mark.asyncio
+async def test_exa_fetch_provider_uses_contents_endpoint(workspace, monkeypatch) -> None:
+    http = AsyncMock(return_value=json.dumps({"results": [{"url": "https://a.example", "text": "x" * 100}]}).encode())
+    monkeypatch.setattr(retrieval, "http_payload", http)
+    with pytest.raises(ValidationError, match="fetch_provider=exa requires exa_api_key"):
+        RetrievalConfig(mode="live", serper_api_key="s", fetch_provider="exa")
+    client = Retrieval(RetrievalConfig(mode="live", search_provider="exa", exa_api_key="k", fetch_provider="exa"))
+    page = await client.call("fetch_webpage", {"url": "https://a.example", "max_chars": 10}, workspace)
+    assert page["context"] == "x" * 10 and "full_text" not in page
+    args, kwargs = http.call_args
+    assert args[1:] == ("POST", "https://api.exa.ai/contents")
+    assert kwargs["headers"] == {"x-api-key": "k"}
+    assert kwargs["json"] == {"urls": ["https://a.example"], "text": {"maxCharacters": retrieval.MAX_FETCH_CHARS}}
+    http.return_value = b'{"results": [], "statuses": [{"id": "https://a.example", "status": "error"}]}'
+    with pytest.raises(ValueError, match="no page content"):
+        await client.call("fetch_webpage", {"url": "https://a.example"}, workspace)
+
+
+@pytest.mark.asyncio
+async def test_contamination_guard_drops_benchmark_items(workspace, monkeypatch) -> None:
+    organic = [
+        {"title": "Clean", "link": "https://clean.example", "snippet": "fine"},
+        {"title": "Mirror", "link": "https://huggingface.co/datasets/Crystal1047/Agentic-MME", "snippet": "x"},
+        {"title": "Paper", "link": "https://p.example", "snippet": "the Agentic MME benchmark answers"},
+    ]
+    http = AsyncMock(return_value=json.dumps({"organic": organic}).encode())
+    monkeypatch.setattr(retrieval, "http_payload", http)
+    client = Retrieval(RetrievalConfig(mode="live", serper_api_key="s"))
+    result = await client.call("google_search", {"query": "q"}, workspace)
+    assert [r["title"] for r in result["raw"]["organic"]] == ["Clean"]
+    assert result["contaminated"] == 2 and "Mirror" not in result["context"]
+    http.return_value = json.dumps({"organic": organic[1:]}).encode()
+    result = await client.call("google_search", {"query": "q"}, workspace)
+    assert result["context"] == retrieval.CONTAMINATED_MESSAGE and result["raw"] == {}
+    # A benchmark URL is refused without a provider call; a contaminated page is withheld.
+    n = http.call_count
+    page = await client.call("fetch_webpage", {"url": "https://github.com/ChoS3nE11ven/Agentic-MME"}, workspace)
+    assert page["context"] == retrieval.CONTAMINATED_MESSAGE and http.call_count == n
+    http.return_value = b"intro ... from the agentic_mme dataset ..."
+    page = await client.call("fetch_webpage", {"url": "https://blog.example/post"}, workspace)
+    assert page["context"] == retrieval.CONTAMINATED_MESSAGE and page["contaminated"] == 1
+    # An empty pattern list disables the guard.
+    off = Retrieval(RetrievalConfig(mode="live", serper_api_key="s", contamination_patterns=[]))
+    assert (
+        "agentic_mme" in (await off.call("fetch_webpage", {"url": "https://blog.example/post"}, workspace))["context"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_contamination_guard_filters_cache_hits_but_cache_keeps_raw(tmp_path, workspace, monkeypatch) -> None:
+    organic = [
+        {"title": "Clean", "link": "https://clean.example"},
+        {"title": "Mirror", "link": "https://x.example/agentic-mme"},
+    ]
+    http = AsyncMock(return_value=json.dumps({"organic": organic}).encode())
+    monkeypatch.setattr(retrieval, "http_payload", http)
+    off = Retrieval(
+        RetrievalConfig(mode="live", serper_api_key="s", cache_root=str(tmp_path), contamination_patterns=[])
+    )
+    assert len((await off.call("google_search", {"query": "cached q"}, workspace))["raw"]["organic"]) == 2
+    on = Retrieval(RetrievalConfig(mode="live", serper_api_key="s", cache_root=str(tmp_path)))
+    hit = await on.call("google_search", {"query": "cached q"}, workspace)
+    assert hit["cache"] == "exact" and [r["title"] for r in hit["raw"]["organic"]] == ["Clean"]
+    assert http.call_count == 1
