@@ -77,7 +77,11 @@ def body() -> AgenticMMERunRequest:
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": "What color is the image?"},
-                        {"type": "input_image", "image_url": image_data_url(Image.new("RGB", (8, 4), "red"))},
+                        {
+                            "type": "input_image",
+                            "image_url": image_data_url(Image.new("RGB", (8, 4), "red")),
+                            "detail": "auto",
+                        },
                     ],
                 }
             ]
@@ -91,7 +95,18 @@ def body() -> AgenticMMERunRequest:
 
 
 def request() -> Request:
-    return Request({"type": "http", "headers": []})
+    # A path is required since url_path_for_request reads request.url.path (token-capture routes).
+    return Request(
+        {
+            "type": "http",
+            "headers": [],
+            "method": "POST",
+            "scheme": "http",
+            "server": ("localhost", 80),
+            "path": "/v1/responses",
+            "query_string": b"",
+        }
+    )
 
 
 @pytest.mark.asyncio
