@@ -111,18 +111,15 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
         finished = False
         policy_error = None
         generated = None
-        # Reserve an additional final-answer-only call when the interaction budget ends.
+        # No forced final-answer call: every model call sees the same tools and tool_choice, so each
+        # call's prompt extends the previous one (NeMo RL token capture links a rollout's calls by
+        # that prefix; a tools-stripped answer-only call broke the chain). max_rounds tool rounds
+        # plus one more call to answer; the episode ends unanswered when the rounds run out or the
+        # model calls a tool beyond max_tool_calls.
         max_rounds, max_tool_calls = self.config.max_rounds, self.config.max_tool_calls
         rounds = itertools.count() if max_rounds is None else range(max_rounds + 1)
         for turn in rounds:
-            final_only = turn == max_rounds or (max_tool_calls is not None and attempts >= max_tool_calls)
-            new_params = params.model_copy(
-                update={
-                    "input": [*params.input, *outputs],
-                    "tool_choice": "none" if final_only else "auto",
-                    "tools": [] if final_only else params.tools,
-                }
-            )
+            new_params = params.model_copy(update={"input": [*params.input, *outputs], "tool_choice": "auto"})
             response = await self.server_client.post(
                 server_name=self.config.model_server.name,
                 # Under token capture this is /ng-rollout/<id>/training-token-capture/v1/responses, so the
@@ -148,11 +145,13 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
                 finished = True
                 break
             image_observations = []
+            budget_exceeded = False
             for call in calls:
                 arguments = None
                 try:
-                    if final_only or (max_tool_calls is not None and attempts >= max_tool_calls):
-                        raise ValueError("tool budget exhausted; provide a final answer")
+                    if max_tool_calls is not None and attempts >= max_tool_calls:
+                        budget_exceeded = True
+                        raise ValueError("tool budget exhausted")
                     attempts += 1  # Invalid calls consume budget too.
                     arguments = json.loads(call.arguments)
                     if not isinstance(arguments, dict):
@@ -199,7 +198,7 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
             # Complete all function-call outputs before inserting user images.
             # Some backends emit multiple calls even when parallel_tool_calls=False.
             outputs.extend(image_observations)
-            if final_only:
+            if budget_exceeded:
                 break
         if generated is None:
             generated = NeMoGymResponse.model_validate(

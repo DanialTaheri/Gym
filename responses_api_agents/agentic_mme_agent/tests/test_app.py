@@ -131,8 +131,9 @@ async def test_invalid_calls_consume_budget(tool) -> None:
     result = await agent.run(request(), body())
     assert result.reward == 1  # No tool-success bonus or arbitrary invalid-call penalty.
     assert result.tool_error_count == 1
-    assert seen[1]["tools"] == []
-    assert seen[1]["tool_choice"] == "none"
+    # No answer-only call: the next call keeps the tools, so its prompt extends the previous one.
+    assert seen[1]["tools"] == seen[0]["tools"]
+    assert seen[1]["tool_choice"] == "auto"
 
 
 @pytest.mark.asyncio
@@ -144,8 +145,10 @@ async def test_parallel_calls_cannot_bypass_budget() -> None:
     assert result.successful_tool_calls == 1
     assert result.tool_error_count == 1
     assert result.tool_trace[1]["output"]["error"].startswith("tool budget")
+    # A call beyond the budget ends the episode unanswered: no further model call.
+    assert len(seen) == 1 and result.reward == 0 and result.response.status == "incomplete"
     # All tool replies precede new user messages, including over-budget replies.
-    assert [item["type"] for item in seen[1]["input"][1:]] == [
+    assert [item.type for item in result.response.output] == [
         "function_call",
         "function_call",
         "function_call_output",
@@ -155,13 +158,34 @@ async def test_parallel_calls_cannot_bypass_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_using_the_whole_tool_budget_still_allows_an_answer() -> None:
+    agent, seen = make_agent([response(output=[call()]), response("<answer>red</answer>")], max_tool_calls=1)
+    result = await agent.run(request(), body())
+    assert result.reward == 1 and result.successful_tool_calls == 1
+    assert len(seen) == 2 and seen[1]["tools"] == seen[0]["tools"]
+
+
+@pytest.mark.asyncio
+async def test_every_model_call_extends_the_previous_one() -> None:
+    # Token capture links a rollout's calls by prompt prefix; the budget must never change the
+    # tools or tool_choice of a later call.
+    agent, seen = make_agent([response(output=[call(call_id=f"c{i}")]) for i in range(3)], max_rounds=2)
+    result = await agent.run(request(), body())
+    assert len(seen) == 3 and result.reward == 0
+    for earlier, later in zip(seen, seen[1:]):
+        assert later["tools"] == earlier["tools"] and later["tool_choice"] == earlier["tool_choice"] == "auto"
+        assert later["input"][: len(earlier["input"])] == earlier["input"]
+
+
+@pytest.mark.asyncio
 async def test_round_budget_and_refusing_to_answer() -> None:
     agent, seen = make_agent([response(output=[]), response(output=[call()])], max_rounds=1)
     result = await agent.run(request(), body())
     assert len(seen) == 2
     assert result.reward == 0
     assert result.response.status == "incomplete"
-    assert result.successful_tool_calls == 0
+    # The last allowed call is a normal call: its tool call runs, then the rounds are used up.
+    assert result.successful_tool_calls == 1
 
 
 @pytest.mark.asyncio
@@ -177,7 +201,7 @@ async def test_two_rollouts_are_isolated() -> None:
 async def test_no_tool_budget_and_missing_images() -> None:
     agent, seen = make_agent([response("red")], max_tool_calls=0)
     assert (await agent.run(request(), body())).reward == 1
-    assert seen[0]["tools"] == []
+    assert len(seen[0]["tools"]) == 14  # tools stay visible; any call would end the episode
     task = body()
     task.responses_create_params.input = "no image"
     with pytest.raises(ValueError, match="at least one"):

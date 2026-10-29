@@ -59,8 +59,12 @@ Full S/V, V-tool and V-true checkpoint judging and published-score reproduction
 remain unimplemented. Tool traces retain arguments, outputs and image artifacts
 for future process evaluation. Do not report these runs as official Track A.
 
-The default budget is 15 interaction rounds / 15 attempted tools, plus at most
-one final-answer-only model call. Invalid tool calls consume the budget.
+The default budget is 15 interaction rounds / 15 attempted tools, plus one more
+model call to answer. There is no forced final-answer call: every model call
+keeps the same tools and tool_choice, so each call's prompt extends the previous
+one (NeMo RL token capture links a rollout's calls by that prefix). The episode
+ends unanswered (reward 0) when the rounds run out or the model calls a tool
+beyond the budget. Invalid tool calls consume the budget.
 All prior messages and model token metadata are preserved between turns.
 
 ## Data
