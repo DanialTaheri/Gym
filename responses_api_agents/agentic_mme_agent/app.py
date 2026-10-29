@@ -70,12 +70,13 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
         params: NeMoGymResponseCreateParamsNonStreaming,
         cookies: Any,
         replay: list[dict[str, Any]] | None = None,
+        model_url_path: str = "/v1/responses",
     ) -> tuple[NeMoGymResponse, list[dict[str, Any]], Any, str | None]:
         async with self._rollouts:
             workspace = ImageWorkspace(
                 max_pixels=self.config.max_image_pixels, max_total_pixels=self.config.max_total_image_pixels
             )
-            return await self._episode_with_workspace(params, cookies, replay, workspace)
+            return await self._episode_with_workspace(params, cookies, replay, workspace, model_url_path)
 
     async def _episode_with_workspace(
         self,
@@ -83,6 +84,7 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
         cookies: Any,
         replay: list[dict[str, Any]] | None,
         workspace: ImageWorkspace,
+        model_url_path: str = "/v1/responses",
     ) -> tuple[NeMoGymResponse, list[dict[str, Any]], Any, str | None]:
         params = params.model_copy(deep=True)
         if isinstance(params.input, str):
@@ -123,7 +125,9 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
             )
             response = await self.server_client.post(
                 server_name=self.config.model_server.name,
-                url_path="/v1/responses",
+                # Under token capture this is /ng-rollout/<id>/training-token-capture/v1/responses, so the
+                # policy model server records every call of this rollout; otherwise plain /v1/responses.
+                url_path=model_url_path,
                 json=new_params,
                 cookies=cookies,
             )
@@ -224,14 +228,19 @@ class AgenticMMEAgent(SimpleResponsesAPIAgent):
         response: Response,
         body: NeMoGymResponseCreateParamsNonStreaming = Body(),
     ) -> NeMoGymResponse:
-        result, _, cookies, _ = await self._episode(body, request.cookies)
+        result, _, cookies, _ = await self._episode(
+            body, request.cookies, model_url_path=self.url_path_for_request("/v1/responses", request)
+        )
         for name, value in (cookies or {}).items():
             response.set_cookie(name, value)
         return result
 
     async def run(self, request: Request, body: AgenticMMERunRequest) -> AgenticMMEVerifyResponse:
         result, trace, _, policy_error = await self._episode(
-            body.responses_create_params, request.cookies, body.retrieval_replay
+            body.responses_create_params,
+            request.cookies,
+            body.retrieval_replay,
+            model_url_path=self.url_path_for_run("/v1/responses", body),
         )
         verification = await self.server_client.post(
             server_name=self.config.resources_server.name,
