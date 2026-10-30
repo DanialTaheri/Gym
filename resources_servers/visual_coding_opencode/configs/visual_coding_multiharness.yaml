@@ -63,6 +63,8 @@ visual_coding_codex_agent:
       # Set to the policy's context window; Codex compacts at most at 90% of it.
       model_context_window: 131072
       attach_images: true
+      # NeMo RL sets temperature/top_p/max_output_tokens on every row; the native CLIs reject them.
+      drop_row_sampling_fields: true
       sandbox_provider: visual_coding_opensandbox
       sandbox_config:
         workdir: /workspace
@@ -93,6 +95,8 @@ visual_coding_pi_agent:
       max_output_tokens: 32768
       attach_images: true
       vision: true
+      # NeMo RL sets temperature/top_p/max_output_tokens on every row; the native CLIs reject them.
+      drop_row_sampling_fields: true
       sandbox_provider: visual_coding_opensandbox
       sandbox_config:
         workdir: /workspace

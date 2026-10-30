@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.openai_utils import (
@@ -870,3 +870,19 @@ async def test_task_timeout_reaches_local_subprocess_wait(tmp_path: Path, budget
     assert wait.await_args.kwargs["timeout"] == expected
     assert episode.response.metadata == {"agent_timeout_sec": str(float(expected))}
     assert agent.config.timeout == 1800
+
+
+def test_row_sampling_fields_from_rl_trainers_pass_validation_once_dropped() -> None:
+    # NeMo RL's rollout manager sets these on every row; native Pi rejects them unless they are dropped.
+    from nemo_gym.agent_utils.request_fields import drop_row_sampling_fields
+
+    agent = _make_agent(drop_row_sampling_fields=True)
+    body = NeMoGymResponseCreateParamsNonStreaming(
+        input="Count the circles.", temperature=1.0, top_p=1.0, max_output_tokens=98304
+    )
+    with pytest.raises(HTTPException) as rejected:
+        agent._validate_request(body)
+    assert rejected.value.status_code == 422
+
+    validated = agent._validate_request(drop_row_sampling_fields(body))
+    assert validated.max_output_tokens is None

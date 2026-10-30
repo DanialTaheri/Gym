@@ -39,6 +39,7 @@ from nemo_gym.agent_utils.input_images import (
     part_type,
     upload_bytes,
 )
+from nemo_gym.agent_utils.request_fields import drop_row_sampling_fields
 from nemo_gym.agent_utils.sandbox_session import SandboxSession
 from nemo_gym.agent_utils.task_timeout import AGENT_TIMEOUT_METADATA_KEY, resolve_agent_timeout
 from nemo_gym.base_resources_server import NEMO_GYM_MCP_METADATA_KEY, BaseRunRequest, BaseVerifyResponse
@@ -438,6 +439,10 @@ class CodexAgentConfig(BaseResponsesAPIAgentConfig):
     # image_<i>.<ext> and attach them to the first model call with `codex exec --image`. Codex treats
     # models it does not know (custom Gym models) as image-capable, so no model entry is needed.
     attach_images: bool = False
+    # RL trainers (NeMo RL) set temperature / top_p / max_output_tokens on every row, which this native
+    # harness rejects (422) because it issues its own model calls. True drops them before validation;
+    # sampling is then whatever the Gym model server enforces (its sampling_overrides).
+    drop_row_sampling_fields: bool = False
 
     @model_validator(mode="after")
     def validate_context_budget(self) -> "CodexAgentConfig":
@@ -1284,6 +1289,8 @@ class CodexAgent(SimpleResponsesAPIAgent):
                 raise HTTPException(409, "Codex activation does not match the seeded session and rollout route")
             if state.session.closing:
                 raise HTTPException(409, "Codex session is closing")
+            if self.config.drop_row_sampling_fields:
+                body = drop_row_sampling_fields(body)
             prompt, system = self._sandbox_input(body)
             images = extract_input_images(body.input) if self.config.attach_images else []
             if state.task is None:

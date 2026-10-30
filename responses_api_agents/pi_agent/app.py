@@ -37,6 +37,7 @@ from nemo_gym.agent_utils.input_images import (
     part_type,
     upload_bytes,
 )
+from nemo_gym.agent_utils.request_fields import drop_row_sampling_fields
 from nemo_gym.agent_utils.sandbox_session import SandboxSession
 from nemo_gym.agent_utils.task_timeout import AGENT_TIMEOUT_METADATA_KEY, resolve_agent_timeout
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
@@ -501,6 +502,10 @@ class PiAgentConfig(BaseResponsesAPIAgentConfig):
     # content before the model call.
     attach_images: bool = False
     vision: bool = False
+    # RL trainers (NeMo RL) set temperature / top_p / max_output_tokens on every row, which this native
+    # harness rejects (422) because it issues its own model calls. True drops them before validation;
+    # sampling is then whatever the Gym model server enforces (its sampling_overrides).
+    drop_row_sampling_fields: bool = False
 
     @property
     def command_parts(self) -> list[str]:
@@ -1098,7 +1103,8 @@ class PiAgent(SimpleResponsesAPIAgent):
         )
         conversation_input.append(NeMoGymEasyInputMessage(role="user", content=user_message))
         timeout = resolve_agent_timeout(body.metadata, ceiling=self.config.timeout)
-        images = extract_input_images(body.input) if self.config.attach_images else []
+        # Pass images only when enabled, so the runner call is unchanged without attach_images.
+        image_kwargs = {"images": extract_input_images(body.input)} if self.config.attach_images else {}
 
         output_items, usage, model_name, events = await self._run_pi(
             user_message,
@@ -1106,7 +1112,7 @@ class PiAgent(SimpleResponsesAPIAgent):
             rollout_id=rollout_id,
             collect_observations=collect_observations,
             timeout=timeout,
-            images=images,
+            **image_kwargs,
         )
         observed_output_items = list(output_items)
         if not observed_output_items and events:
@@ -1175,6 +1181,8 @@ class PiAgent(SimpleResponsesAPIAgent):
     ) -> NeMoGymResponse:
         session_id = self._agent_session_id_from_request(request)
         if session_id is not None:
+            if self.config.drop_row_sampling_fields:
+                body = drop_row_sampling_fields(body)
             body = self._validate_request(body)
             state = self._require_agent_session(session_id)
             assert isinstance(state, PiSandboxSession)

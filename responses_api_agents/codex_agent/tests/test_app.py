@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import orjson
 import pytest
 import yaml
-from fastapi import Request
+from fastapi import HTTPException, Request
 from pydantic import ValidationError
 
 from nemo_gym.global_config import SKILLS_REF_KEY_NAME
@@ -995,3 +995,20 @@ async def test_task_timeout_reaches_local_subprocess_wait(tmp_path: Path, budget
     assert wait.await_args.kwargs["timeout"] == expected
     assert response.metadata == {"agent_timeout_sec": str(float(expected))}
     assert agent.config.timeout == 1800
+
+
+def test_row_sampling_fields_from_rl_trainers_pass_input_check_once_dropped() -> None:
+    # NeMo RL's rollout manager sets these on every row; native Codex rejects them unless they are dropped.
+    from nemo_gym.agent_utils.request_fields import drop_row_sampling_fields
+
+    agent = _make_agent(drop_row_sampling_fields=True)
+    body = NeMoGymResponseCreateParamsNonStreaming(
+        input="Count the circles.", temperature=1.0, top_p=1.0, max_output_tokens=98304
+    )
+    with pytest.raises(HTTPException) as rejected:
+        agent._sandbox_input(body)
+    assert rejected.value.status_code == 422
+    assert "does not support request field" in rejected.value.detail
+
+    prompt, _ = agent._sandbox_input(drop_row_sampling_fields(body))
+    assert prompt == "Count the circles."
