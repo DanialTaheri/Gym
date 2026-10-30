@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import base64
 import hashlib
 import json
 import re
@@ -437,6 +438,29 @@ def parse_opencode_observations(
     )
 
 
+_ATTACHMENT_SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp"}
+
+
+def _split_user_content(content: Any) -> tuple[str, list[tuple[str, bytes]]]:
+    """The text and the data-URL images ((suffix, bytes), in order) of one user message."""
+    if isinstance(content, str):
+        return content, []
+    texts: list[str] = []
+    images: list[tuple[str, bytes]] = []
+    for part in content:
+        part = part if isinstance(part, dict) else part.model_dump()
+        if part.get("type") in ("input_text", "text"):
+            texts.append(part["text"])
+        elif part.get("type") == "input_image":
+            match = re.match(r"data:(image/[a-z]+);base64,(.*)", part.get("image_url") or "", re.S)
+            if match is None or match.group(1) not in _ATTACHMENT_SUFFIXES:
+                raise ValueError("input_image must be a base64 png/jpeg/webp data URL")
+            images.append((_ATTACHMENT_SUFFIXES[match.group(1)], base64.b64decode(match.group(2))))
+        else:
+            raise ValueError(f"unsupported user content part: {part.get('type')}")
+    return "\n".join(texts), images
+
+
 class OpenCodeSandboxedAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: ModelServerRef
@@ -494,6 +518,12 @@ class OpenCodeSandboxedAgentConfig(BaseResponsesAPIAgentConfig):
     # imports them into its own process and calls them at defined hook points, so they can edit
     # the live request, replace a builtin tool, or end a run. See plugins/ for what each does.
     opencode_plugins: List[str] = Field(default_factory=list)
+
+    # Multimodal tasks: upload the user turn's data-URL images into the sandbox and attach them to
+    # the run with `-f`. The model entry must also be image-capable
+    # (opencode_config.provider.<id>.models.dummy_model.attachment + modalities), otherwise
+    # OpenCode replaces every image with an error string. Off: a user turn with images is rejected.
+    attach_images: bool = False
 
     # Sandbox config
     sandbox_provider: str
@@ -968,8 +998,8 @@ class OpenCodeSandboxedAgent(SimpleResponsesAPIAgent):
 
         return messages
 
-    async def _upload_plugin_verified(self, sandbox: Any, local: Path, remote: str, attempts: int = 3) -> None:
-        """Upload one plugin and READ IT BACK, retrying until the bytes in the sandbox match.
+    async def _upload_verified(self, sandbox: Any, local: Path, remote: str, attempts: int = 3) -> None:
+        """Upload one file (a plugin, or an attached image) and READ IT BACK, retrying until the bytes match.
 
         Why a read-back rather than trusting the write. opencode swallows plugin load failures, so
         a plugin that never arrived produces a run that looks entirely healthy; the sentinel gate
@@ -1001,7 +1031,7 @@ class OpenCodeSandboxedAgent(SimpleResponsesAPIAgent):
             except Exception as e:  # noqa: BLE001 - any failure here is retryable
                 last = f"{type(e).__name__}: {e}"
             print(
-                f"[opencode_sandboxed_agent] plugin upload verify failed for {remote} "
+                f"[opencode_sandboxed_agent] upload verify failed for {remote} "
                 f"(attempt {attempt + 1}/{attempts}): {last}",
                 file=sys.stderr,
                 flush=True,
@@ -1010,7 +1040,7 @@ class OpenCodeSandboxedAgent(SimpleResponsesAPIAgent):
                 await asyncio.sleep(2**attempt)
         # Fail loudly rather than letting opencode start with a plugin list pointing at a file
         # that is not there -- that is the silent mode this whole method exists to prevent.
-        raise RuntimeError(f"opencode plugin {local.name} did not land in the sandbox at {remote}: {last}")
+        raise RuntimeError(f"{local.name} did not land in the sandbox at {remote}: {last}")
 
     async def responses(
         self,
@@ -1022,17 +1052,16 @@ class OpenCodeSandboxedAgent(SimpleResponsesAPIAgent):
         sandbox = self._sandbox_id_to_sandbox[request.cookies["sandbox_id"]]
 
         query = None
+        images: list[tuple[str, bytes]] = []
         # This can be modified to handle system/developer prompts too.
         for input_item in body.input:
             if input_item.role == "user":
                 assert not query, body.input
-                if isinstance(input_item.content, str):
-                    query = input_item.content
-                elif isinstance(input_item.content, list):
-                    assert len(input_item.content) == 1, body.input
-                    query = input_item.content[0]["text"]
+                query, images = _split_user_content(input_item.content)
 
         assert query, body.input
+        if images and not self.config.attach_images:
+            raise ValueError("the user turn carries images but attach_images is off")
 
         opencode_debug_str = ""
         if self.config.debug:
@@ -1071,7 +1100,7 @@ class OpenCodeSandboxedAgent(SimpleResponsesAPIAgent):
         # success and does not land would otherwise leave the MCP gate, the output-token hook or
         # a guard silently absent from a run that still looks healthy and still gets scored.
         for local, remote in self._plugin_uploads():
-            await self._upload_plugin_verified(sandbox, local, remote)
+            await self._upload_verified(sandbox, local, remote)
         build_agent = effective_config.setdefault("agent", {}).setdefault("build", {})
         for name in ("temperature", "top_p"):
             value = getattr(body, name, None)
@@ -1103,6 +1132,23 @@ class OpenCodeSandboxedAgent(SimpleResponsesAPIAgent):
                 '&& chmod 0755 "$HOME/.opencode/bin/rg" '
                 '&& "$HOME/.opencode/bin/rg" --version'
             )
+
+        attachment_args = ""
+        if images:
+            attachment_dir = f"/tmp/nemo-gym-attachments-{uuid4().hex}"
+            mkdir_result = await sandbox.exec(command=f"mkdir -p {quote(attachment_dir)}", timeout_s=60)
+            if mkdir_result.return_code != 0 or mkdir_result.error_type:
+                raise RuntimeError(f"Could not create the attachment directory: {mkdir_result}")
+            remote_images = []
+            with TemporaryDirectory() as tmp:
+                for index, (suffix, data) in enumerate(images):
+                    local = Path(tmp) / f"image_{index}{suffix}"
+                    local.write_bytes(data)
+                    remote = f"{attachment_dir}/{local.name}"
+                    await self._upload_verified(sandbox, local, remote)
+                    remote_images.append(remote)
+            # Repeated -f (an array flag) goes before the query's `--`, which ends the option list.
+            attachment_args = " ".join(f"-f {quote(remote)}" for remote in remote_images)
 
         extra_env_str = " ".join(f"{k}={quote(v)}" for k, v in sorted(self._resolve_opencode_env(query).items()))
 
@@ -1147,7 +1193,7 @@ class OpenCodeSandboxedAgent(SimpleResponsesAPIAgent):
         && echo "Installed OpenCode" \
         && rm -f /tmp/nemo-gym-mcp-setup-error \
         && {query_seed_str}NEMO_GYM_REQUIRED_MCP_SERVERS={quote(json.dumps([s.name for s in self.config.tool_servers]))} OPENCODE_CONFIG_CONTENT={quote(opencode_config_content)} OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=1000000000 {xdg_home_str} {extra_env_str} \
-            opencode run --title "NG dummy title" {opencode_debug_str} {opencode_thinking_str} {query_arg_str} \
+            opencode run --title "NG dummy title" {opencode_debug_str} {opencode_thinking_str} {attachment_args} {query_arg_str} \
         && echo "OpenCode run finished"
         """
 

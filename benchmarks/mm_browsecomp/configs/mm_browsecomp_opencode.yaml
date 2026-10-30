@@ -1,0 +1,37 @@
+# MM-BrowseComp on OpenCode inside an OpenSandbox sandbox (PR #4935's search harness).
+# The question images are uploaded into the sandbox and attached to `opencode run` with -f; the
+# model entry is declared image-capable so OpenCode sends them (and returns images from `read`).
+config_paths:
+- benchmarks/browsecomp/configs/browsecomp_opencode.yaml
+
+opencode_sandboxed_search_agent:
+  responses_api_agents:
+    opencode_sandboxed_agent:
+      attach_images: true
+      opencode_env:
+        # BrowseComp's TDM opt-out domains plus huggingface.co / hf.co (the encrypted dataset and
+        # its decrypt script live there); the same list as exclusions.json for the other harness.
+        OPENCODE_WEBSEARCH_EXCLUDE_DOMAINS: "ad-italia.it:ad-magazin.de:admagazine.fr:allure.com:architecturaldigest.com:arstechnica.com:bonappetit.com:cntraveler.com:cntraveller.com:cntraveller.de:epicurious.com:glamour.com:glamour.de:glamour.es:glamourmagazine.co.uk:gq-magazine.co.uk:gq.com:gqitalia.it:gqmagazine.fr:johansens.com:lacucinaitaliana.com:newyorker.com:nyt.com:nytimes.com:nytimescooking.com:pitchfork.com:revistaad.es:revistagq.com:revistavanityfair.es:self.com:tatler.com:teenvogue.com:theathletic.com:them.us:vanityfair.com:vanityfair.fr:vanityfair.it:vogue.co.uk:vogue.com:vogue.de:vogue.fr:vogue.it:voguebusiness.com:wirecutter.com:wired.com:wired.it:worldofinteriors.com:huggingface.co:hf.co"
+      opencode_config:
+        permission:
+          bash:
+            "*curl *huggingface.co*": deny
+            "*wget *huggingface.co*": deny
+            "*curl *hf.co*": deny
+            "*wget *hf.co*": deny
+        provider:
+          nemo_gym:
+            models:
+              dummy_model:
+                attachment: true
+                modalities:
+                  input: [text, image]
+                  output: [text]
+      # OmegaConf replaces lists wholesale, so the dataset entry is restated in full.
+      datasets:
+      - name: mm_browsecomp
+        type: benchmark
+        jsonl_fpath: benchmarks/mm_browsecomp/data/mm_browsecomp_benchmark.jsonl
+        prompt_config: null
+        prepare_script: benchmarks/mm_browsecomp/prepare.py
+        num_repeats: 1

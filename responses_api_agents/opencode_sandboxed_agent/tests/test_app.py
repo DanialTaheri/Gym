@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import base64
 import json
 import os
 import re
@@ -60,6 +61,7 @@ from responses_api_agents.opencode_sandboxed_agent.app import (
     OpenCodeSandboxedAgent,
     OpenCodeSandboxedAgentConfig,
     OpenCodeSandboxedAgentRunRequest,
+    _split_user_content,
 )
 
 
@@ -881,6 +883,109 @@ class TestOpenCodeSandboxedAgent:
             assert "<" not in argv, argv
             assert argv[-2] == "--", argv
             assert argv[-1] == question, argv
+
+    def test_split_user_content_text_and_images(self) -> None:
+        png, jpg = b"\x89PNG-bytes", b"\xff\xd8jpeg-bytes"
+        content = [
+            {"type": "input_text", "text": "Which stadium?"},
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64," + base64.b64encode(png).decode(),
+                "detail": "high",
+            },
+            {"type": "input_image", "image_url": "data:image/jpeg;base64," + base64.b64encode(jpg).decode()},
+        ]
+        assert _split_user_content(content) == ("Which stadium?", [(".png", png), (".jpg", jpg)])
+        assert _split_user_content("plain") == ("plain", [])
+        with raises(ValueError):
+            _split_user_content([{"type": "input_image", "image_url": "https://example.com/a.png"}])
+        with raises(ValueError):
+            _split_user_content([{"type": "input_file", "file_id": "f"}])
+
+    @mark.parametrize("via_stdin", [False, True], ids=("argv", "stdin"))
+    @mark.parametrize("attach_images", [False, True])
+    async def test_responses_attaches_user_images(
+        self, opencode_export_test_data: Dict[str, Any], monkeypatch: MonkeyPatch, via_stdin: bool, attach_images: bool
+    ) -> None:
+        """Images in the user turn are uploaded, verified and passed with `-f` ahead of the query."""
+        png = b"\x89PNG-image-bytes"
+        question = "Which stadium is this?"
+        config = self._create_config()
+        config.attach_images = attach_images
+        config.opencode_query_via_stdin = via_stdin
+        server = OpenCodeSandboxedAgent(config=config, server_client=MagicMock(spec=ServerClient))
+
+        uploads: Dict[str, bytes] = {}
+
+        async def _upload(local: Path, remote: str) -> None:
+            uploads[remote] = Path(local).read_bytes()
+
+        async def _download(remote: str, local: Path) -> None:
+            Path(local).write_bytes(uploads[remote])
+
+        async def _exec(command: str = "", **_kwargs: Any) -> SimpleNamespace:
+            stdout = json.dumps([{"id": "ses_123"}]) if "session list" in command else ""
+            return SimpleNamespace(stdout=stdout, stderr="", return_code=0, error_type=None)
+
+        sandbox_mock = MagicMock()
+        sandbox_mock.exec = AsyncMock(side_effect=_exec)
+        sandbox_mock.upload = AsyncMock(side_effect=_upload)
+        sandbox_mock.download = AsyncMock(side_effect=_download)
+        monkeypatch.setattr(server, "_sandbox_id_to_sandbox", {"": sandbox_mock})
+        monkeypatch.setattr(server, "_create_opencode_config", AsyncMock(return_value=dict()))
+        monkeypatch.setattr(
+            "responses_api_agents.opencode_sandboxed_agent.app.sandbox_server_url",
+            lambda _name, **_kwargs: "http://model-server",
+        )
+        monkeypatch.setattr(
+            "responses_api_agents.opencode_sandboxed_agent.app._read_opencode_child_messages",
+            lambda _db_path, _root_session_id: [],
+        )
+        monkeypatch.setattr("responses_api_agents.opencode_sandboxed_agent.app.Path.exists", lambda self: True)
+        monkeypatch.setattr(
+            "responses_api_agents.opencode_sandboxed_agent.app.Path.read_text",
+            lambda self: json.dumps(opencode_export_test_data),
+        )
+        body = NeMoGymResponseCreateParamsNonStreaming(
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": question},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64," + base64.b64encode(png).decode(),
+                            "detail": "high",
+                        },
+                    ],
+                }
+            ]
+        )
+        request = MagicMock(session={SESSION_ID_KEY: "s"}, cookies={"sandbox_id": ""}, path_params={})
+
+        if not attach_images:
+            with raises(ValueError, match="attach_images"):
+                await server.responses(request=request, body=body)
+            sandbox_mock.upload.assert_not_awaited()
+            return
+
+        await server.responses(request=request, body=body)
+
+        (remote,) = uploads
+        assert remote.endswith("/image_0.png") and uploads[remote] == png
+        (command,) = [
+            call.kwargs["command"]
+            for call in sandbox_mock.exec.await_args_list
+            if "opencode run" in (call.kwargs.get("command") or "")
+        ]
+        tokens = shlex.split(command)
+        run = tokens[tokens.index("opencode") :]
+        run = run[: run.index("&&")]
+        assert run[run.index("-f") + 1] == remote
+        if via_stdin:
+            assert "--" not in run and question in tokens
+        else:
+            assert run.index("-f") < run.index("--") and run[-1] == question
 
     @mark.parametrize(
         "database_name,snapshot_failure",
