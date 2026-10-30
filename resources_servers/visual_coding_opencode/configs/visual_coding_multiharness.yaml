@@ -116,6 +116,12 @@ visual_coding_codex_environment:
       agent_server:
         type: responses_api_agents
         name: visual_coding_codex_agent
+      # Required by single_agent_turn_legacy (values from its default config); an episode outlasts the agent's
+      # 1800 s session timeout plus sandbox start and the Node/CLI install.
+      max_concurrent_episodes: null
+      queue_timeout_seconds: null
+      default_episode_timeout_seconds: 3600
+      cleanup_timeout_seconds: 180
 
 visual_coding_pi_environment:
   environment_servers:
@@ -127,3 +133,9 @@ visual_coding_pi_environment:
       agent_server:
         type: responses_api_agents
         name: visual_coding_pi_agent
+      # Required by single_agent_turn_legacy (values from its default config); an episode outlasts the agent's
+      # 1800 s session timeout plus sandbox start and the Node/CLI install.
+      max_concurrent_episodes: null
+      queue_timeout_seconds: null
+      default_episode_timeout_seconds: 3600
+      cleanup_timeout_seconds: 180
