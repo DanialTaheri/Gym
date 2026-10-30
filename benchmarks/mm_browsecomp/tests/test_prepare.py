@@ -107,3 +107,11 @@ def test_image_data_uri_follows_the_bytes_not_the_extension(tmp_path):
     junk.write_bytes(b"GIF89a")
     with raises(ValueError):
         mm._data_uri(junk)
+
+
+def test_shards_are_disjoint_and_cover_all_rows():
+    rows = list(range(400))
+    shards = [mm.select_shard(rows, f"{k}/4") for k in range(4)]
+    assert [len(shard) for shard in shards] == [100] * 4
+    assert sorted(row for shard in shards for row in shard) == rows
+    assert mm.select_shard(rows, "1/4")[:3] == [1, 5, 9]

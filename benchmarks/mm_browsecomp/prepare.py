@@ -24,6 +24,8 @@ extract the images from that same turn.
 
 Set MM_BROWSECOMP_DIR to a directory holding ``MMBrowseComp_400.jsonl`` and ``images/`` to prepare
 offline; otherwise both are downloaded from GitHub into ``data/cache``.
+MM_BROWSECOMP_SHARD=k/N keeps only every N-th question starting at k, to split one evaluation across
+N independent jobs (the shards are disjoint and together cover all 400 questions).
 """
 
 import base64
@@ -128,12 +130,21 @@ def map_row(row: dict, image_uris: list[str], date: str) -> dict:
     }
 
 
+def select_shard(rows: list[dict], shard: str) -> list[dict]:
+    """The rows of shard 'k/N': every N-th row starting at k."""
+    index, count = (int(part) for part in shard.split("/"))
+    assert 0 <= index < count, f"bad MM_BROWSECOMP_SHARD {shard!r}"
+    return rows[index::count]
+
+
 def prepare() -> Path:
     """Write the 400 MM-BrowseComp rows. Returns the output file path."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     source = _source_dir()
     rows = [json.loads(line) for line in (source / DATASET_FILE).read_text().splitlines() if line.strip()]
     assert len(rows) == EXPECTED_ROWS, f"Expected {EXPECTED_ROWS} rows, got {len(rows)}"
+    if os.environ.get("MM_BROWSECOMP_SHARD"):
+        rows = select_shard(rows, os.environ["MM_BROWSECOMP_SHARD"])
 
     urls = sorted({url for row in rows for url in row["images"]})
     with ThreadPoolExecutor(16) as pool:
