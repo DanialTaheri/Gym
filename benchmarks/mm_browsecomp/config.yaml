@@ -5,12 +5,12 @@
 config_paths:
 - benchmarks/browsecomp/config.yaml
 
-# The BrowseComp TDM opt-out domains plus huggingface.co / hf.co, where the encrypted dataset and its
+# (resolved from the server directory) The BrowseComp TDM opt-out domains plus huggingface.co / hf.co, where the encrypted dataset and its
 # decrypt script are hosted. Same list as OPENCODE_WEBSEARCH_EXCLUDE_DOMAINS in the OpenCode config.
 browsecomp_benchmark_resources_server:
   resources_servers:
     browsecomp_advanced_harness:
-      exclude_domains_file_path: benchmarks/mm_browsecomp/exclusions.json
+      exclude_domains_file_path: ../../benchmarks/mm_browsecomp/exclusions.json
 
 browsecomp_benchmark_agent:
   responses_api_agents:
