@@ -31,6 +31,12 @@ from uuid import uuid4
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
+from nemo_gym.agent_utils.input_images import (
+    extract_input_images,
+    image_file_names,
+    part_type,
+    upload_bytes,
+)
 from nemo_gym.agent_utils.sandbox_session import SandboxSession
 from nemo_gym.agent_utils.task_timeout import AGENT_TIMEOUT_METADATA_KEY, resolve_agent_timeout
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
@@ -489,6 +495,12 @@ class PiAgentConfig(BaseResponsesAPIAgentConfig):
     sandbox_install_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
     sandbox_bash_timeout_seconds: int = Field(default=900, gt=0)
     session_close_timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
+    # Multimodal tasks: write the last user message's data-URL images into the workdir as
+    # image_<i>.<ext> and pass them as `@file` arguments, which Pi attaches to the first message.
+    # `vision` declares the generated (model_server) model image-capable; without it Pi drops image
+    # content before the model call.
+    attach_images: bool = False
+    vision: bool = False
 
     @property
     def command_parts(self) -> list[str]:
@@ -647,12 +659,16 @@ class PiAgent(SimpleResponsesAPIAgent):
         roles = [getattr(item, "role", None) for item in items]
         if roles not in (["user"], ["system", "user"]):
             raise HTTPException(422, "Pi accepts one text user prompt with an optional system message")
+        allowed_parts = {"input_text", "input_image"} if self.config.attach_images else {"input_text"}
         for item in items:
             if not isinstance(item.content, str) and any(
-                (part.get("type") if isinstance(part, dict) else getattr(part, "type", None)) != "input_text"
-                for part in item.content
+                part_type(part) not in allowed_parts for part in item.content
             ):
-                raise HTTPException(422, "Pi only supports text input")
+                raise HTTPException(
+                    422,
+                    "Pi only supports text input"
+                    + ("" if self.config.attach_images else " (set attach_images for image parts)"),
+                )
         return body.model_copy(update={"input": items}).model_copy(deep=True)
 
     def _conversation_input(self, body: NeMoGymResponseCreateParamsNonStreaming) -> tuple[str, str]:
@@ -668,6 +684,7 @@ class PiAgent(SimpleResponsesAPIAgent):
         *,
         prompt: str,
         system: str,
+        images: Optional[list[tuple[str, bytes]]] = None,
     ) -> NeMoGymResponse:
         # Sandbox sessions use only Gym's provider; do not copy credentials for
         # unrelated direct providers from the host configuration into the sandbox.
@@ -715,6 +732,10 @@ class PiAgent(SimpleResponsesAPIAgent):
             command += ["--thinking", self.config.thinking]
         if system:
             command += ["--append-system-prompt", system]
+        for name, (_, data) in zip(image_file_names(images or []), images or []):
+            path = f"{state.session.workdir.rstrip('/')}/{name}"
+            await upload_bytes(state.session.sandbox, path=path, data=data)
+            command.append(f"@{path}")
         payload = {
             "directory": state.session.session_dir,
             "command": command,
@@ -942,7 +963,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                 {
                     "id": self.config.model,
                     "reasoning": True,
-                    "input": ["text"],
+                    "input": ["text", "image"] if self.config.vision else ["text"],
                     "contextWindow": self.config.context_window,
                     "maxTokens": self.config.max_output_tokens,
                 }
@@ -962,6 +983,7 @@ class PiAgent(SimpleResponsesAPIAgent):
         rollout_id: Optional[str] = None,
         collect_observations: bool = True,
         timeout: float | None = None,
+        images: Optional[list[tuple[str, bytes]]] = None,
     ) -> tuple[list[Any], dict[str, int], str, list[tuple[float, dict[str, Any]]]]:
         timeout = self.config.timeout if timeout is None else timeout
         # Local callers still get automatic installation. Sandbox sessions never
@@ -1010,6 +1032,10 @@ class PiAgent(SimpleResponsesAPIAgent):
             cmd += ["--append-system-prompt", system_prompt]
         cmd += self.config.extra_args
         cmd.append(instruction)
+        for name, (_, data) in zip(image_file_names(images or []), images or []):
+            path = work_dir / name
+            path.write_bytes(data)
+            cmd.append(f"@{path}")
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1072,6 +1098,7 @@ class PiAgent(SimpleResponsesAPIAgent):
         )
         conversation_input.append(NeMoGymEasyInputMessage(role="user", content=user_message))
         timeout = resolve_agent_timeout(body.metadata, ceiling=self.config.timeout)
+        images = extract_input_images(body.input) if self.config.attach_images else []
 
         output_items, usage, model_name, events = await self._run_pi(
             user_message,
@@ -1079,6 +1106,7 @@ class PiAgent(SimpleResponsesAPIAgent):
             rollout_id=rollout_id,
             collect_observations=collect_observations,
             timeout=timeout,
+            images=images,
         )
         observed_output_items = list(output_items)
         if not observed_output_items and events:
@@ -1156,10 +1184,13 @@ class PiAgent(SimpleResponsesAPIAgent):
             if state.session.closing:
                 raise HTTPException(409, "Pi session is closing")
             prompt, system = self._conversation_input(body)
+            images = extract_input_images(body.input) if self.config.attach_images else []
             if state.task is None:
                 # Bind the request before the first await so retries join one invocation.
                 state.activation_request = body.model_copy(deep=True)
-                state.task = asyncio.create_task(self._sandbox_response(state, body, prompt=prompt, system=system))
+                state.task = asyncio.create_task(
+                    self._sandbox_response(state, body, prompt=prompt, system=system, images=images)
+                )
             elif body != state.activation_request:
                 raise HTTPException(409, "Pi sandbox sessions support one activation; retry the same request")
             # Session close owns cancellation. Losing an HTTP waiter must not stop the harness.

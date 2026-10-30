@@ -1697,3 +1697,48 @@ def test_task_timeout_does_not_allow_other_metadata_or_consume_activation(
         assert accepted.status_code == 200, accepted.text
         closed = client.post("/v1/agent_sessions/close", json=close_body(session_id))
         assert closed.status_code == 200, closed.text
+
+
+_IMAGE_INPUT = [
+    {
+        "role": "user",
+        "content": [
+            # base64 of the ASCII bytes "PNGBYTES"; the fake sandbox stores uploads as text.
+            {"type": "input_image", "image_url": "data:image/png;base64,UE5HQllURVM=", "detail": "auto"},
+            {"type": "input_text", "text": "How many shapes?"},
+        ],
+    }
+]
+
+
+def test_image_parts_rejected_unless_attach_images(setup):
+    agent, sandbox = setup
+    with TestClient(agent.setup_webserver()) as client:
+        session_id = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json")).json()["agent_session_id"]
+        result = client.post("/ng-rollout/pi-smoke-a2/v1/responses", json={"input": _IMAGE_INPUT})
+        assert result.status_code == 422, result.text
+        assert "attach_images" in result.text
+        assert client.post("/v1/agent_sessions/close", json=close_body(session_id)).status_code == 200
+    sandbox.launch.assert_not_awaited()
+
+
+def test_attach_images_uploads_task_images_and_passes_them_to_pi(setup):
+    agent, sandbox = setup
+    agent.config.attach_images = True
+    agent.config.vision = True
+    with TestClient(agent.setup_webserver()) as client:
+        session_id = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json")).json()["agent_session_id"]
+        response = client.post("/ng-rollout/pi-smoke-a2/v1/responses", json={"input": _IMAGE_INPUT})
+        assert response.status_code == 200, response.text
+        payload = json.loads(sandbox.files[f"{sandbox.directory}/input.json"])
+        assert sandbox.files["/app/image_0.png"] == "PNGBYTES"
+        assert payload["prompt"] == "How many shapes?"
+        assert payload["command"][-1] == "@/app/image_0.png"
+        models = json.loads(sandbox.files[f"{sandbox.directory}/home/.pi/agent/models.json"])
+        assert models["providers"]["nemo"]["models"][0]["input"] == ["text", "image"]
+        assert client.post("/v1/agent_sessions/close", json=close_body(session_id)).status_code == 200
+
+
+def test_models_stay_text_only_without_vision(setup):
+    agent, _ = setup
+    assert agent._build_models_config()["providers"]["nemo"]["models"][0]["input"] == ["text"]
