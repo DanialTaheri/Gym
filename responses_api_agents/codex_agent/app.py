@@ -33,6 +33,12 @@ from uuid import uuid4
 from fastapi import HTTPException, Request
 from pydantic import ConfigDict, Field, PrivateAttr, model_validator
 
+from nemo_gym.agent_utils.input_images import (
+    extract_input_images,
+    image_file_names,
+    part_type,
+    upload_bytes,
+)
 from nemo_gym.agent_utils.sandbox_session import SandboxSession
 from nemo_gym.agent_utils.task_timeout import AGENT_TIMEOUT_METADATA_KEY, resolve_agent_timeout
 from nemo_gym.base_resources_server import NEMO_GYM_MCP_METADATA_KEY, BaseRunRequest, BaseVerifyResponse
@@ -428,6 +434,10 @@ class CodexAgentConfig(BaseResponsesAPIAgentConfig):
     sandbox_config: dict[str, Any] = Field(default_factory=dict)
     sandbox_install_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
     session_close_timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
+    # Multimodal tasks: write the last user message's data-URL images into the workdir as
+    # image_<i>.<ext> and attach them to the first model call with `codex exec --image`. Codex treats
+    # models it does not know (custom Gym models) as image-capable, so no model entry is needed.
+    attach_images: bool = False
 
     @model_validator(mode="after")
     def validate_context_budget(self) -> "CodexAgentConfig":
@@ -629,18 +639,24 @@ class CodexAgent(SimpleResponsesAPIAgent):
         roles = [getattr(item, "role", None) for item in items]
         if roles not in (["user"], ["system", "user"], ["developer", "user"]):
             raise HTTPException(422, "Native Codex accepts one text user prompt with an optional system message")
+        allowed_parts = {"input_text", "input_image"} if self.config.attach_images else {"input_text"}
         for item in items:
             if not isinstance(item.content, str) and any(
-                (part.get("type") if isinstance(part, dict) else getattr(part, "type", None)) != "input_text"
-                for part in item.content
+                part_type(part) not in allowed_parts for part in item.content
             ):
-                raise HTTPException(422, "Native Codex only supports text input")
+                raise HTTPException(
+                    422,
+                    "Native Codex only supports text input"
+                    + ("" if self.config.attach_images else " (set attach_images for image parts)"),
+                )
 
         def text(item):
-            return (
-                item.content
-                if isinstance(item.content, str)
-                else "".join(part["text"] if isinstance(part, dict) else part.text for part in item.content)
+            if isinstance(item.content, str):
+                return item.content
+            return "".join(
+                part["text"] if isinstance(part, dict) else part.text
+                for part in item.content
+                if part_type(part) == "input_text"
             )
 
         prompt = text(items[-1])
@@ -671,13 +687,19 @@ class CodexAgent(SimpleResponsesAPIAgent):
         *,
         prompt: str,
         system: str,
+        images: Optional[list[tuple[str, bytes]]] = None,
     ) -> NeMoGymResponse:
         config = self._build_config(
             self._resolve_call_base_url(state.request.episode_id.capture_key), developer_instructions=system
         )
         await state.upload_text("home/.codex/config.toml", toml_dumps(config))
+        image_paths = []
+        for name, (_, data) in zip(image_file_names(images or []), images or []):
+            path = f"{state.session.workdir.rstrip('/')}/{name}"
+            await upload_bytes(state.session.sandbox, path=path, data=data)
+            image_paths.append(path)
         timeout = resolve_agent_timeout(body.metadata, ceiling=self.config.timeout)
-        command = self._build_command("-", state.session.workdir)
+        command = self._build_command("-", state.session.workdir, images=image_paths)
         command[0:1] = [
             f"{state.runtime}/node/bin/node",
             f"{state.runtime}/codex/node_modules/@openai/codex/bin/codex.js",
@@ -1016,14 +1038,16 @@ class CodexAgent(SimpleResponsesAPIAgent):
             raise
         return codex_home
 
-    def _build_command(self, instruction: str, cwd: str) -> list[str]:
+    def _build_command(self, instruction: str, cwd: str, images: Optional[list[str]] = None) -> list[str]:
         """Construct the ``codex exec`` argv.
 
         ``--json`` emits machine-readable JSONL events; ``--ephemeral`` skips session persistence
         unless `_run_codex` needs temporary native evidence for a correlated rollout.
         ``--skip-git-repo-check`` allows running in the per-rollout scratch dir. Sandboxing and
         approvals are pinned in the generated config.toml (``approval_policy = "never"``), not argv.
-        The ``--`` separator keeps prompts from being parsed as flags or subcommands.
+        The ``--`` separator keeps prompts from being parsed as flags or subcommands. ``--image``
+        attaches each image file to the initial prompt; it takes values until the next flag, so it
+        stays before ``--``.
         """
         return [
             "codex",
@@ -1033,6 +1057,7 @@ class CodexAgent(SimpleResponsesAPIAgent):
             "--skip-git-repo-check",
             "--cd",
             cwd,
+            *(arg for path in images or [] for arg in ("--image", path)),
             "--",
             instruction,
         ]
@@ -1046,6 +1071,7 @@ class CodexAgent(SimpleResponsesAPIAgent):
         rollout_id: Optional[str] = None,
         *,
         timeout: float | None = None,
+        images: Optional[list[tuple[str, bytes]]] = None,
     ) -> tuple[str, str, Optional[AgentObservationBundle], bool]:
         """Run ``codex exec --json`` and return (stdout, model_name, observations, timed_out).
 
@@ -1090,7 +1116,12 @@ class CodexAgent(SimpleResponsesAPIAgent):
                 "OPENAI_API_KEY": self.config.openai_api_key or "local",  # pragma: allowlist secret
             }
 
-            command = self._build_command(instruction, cwd)
+            image_paths = []
+            for name, (_, data) in zip(image_file_names(images or []), images or []):
+                path = Path(cwd) / name
+                path.write_bytes(data)
+                image_paths.append(str(path.resolve()))
+            command = self._build_command(instruction, cwd, images=image_paths)
             if rollout_id is not None:
                 command.remove("--ephemeral")
             proc = await asyncio.create_subprocess_exec(
@@ -1177,6 +1208,7 @@ class CodexAgent(SimpleResponsesAPIAgent):
         system_parts = [p for p in [self.config.system_prompt, input_system] if p]
         system_prompt = "\n\n".join(system_parts) if system_parts else None
         timeout = resolve_agent_timeout(body.metadata, ceiling=self.config.timeout)
+        images = extract_input_images(body.input) if self.config.attach_images else []
 
         stdout, model_name, observations, timed_out = await self._run_codex(
             user_message,
@@ -1185,6 +1217,7 @@ class CodexAgent(SimpleResponsesAPIAgent):
             skills_path=skills_path,
             rollout_id=rollout_id,
             timeout=timeout,
+            images=images,
         )
         output_items, usage = parse_exec_jsonl(stdout)
 
@@ -1252,9 +1285,12 @@ class CodexAgent(SimpleResponsesAPIAgent):
             if state.session.closing:
                 raise HTTPException(409, "Codex session is closing")
             prompt, system = self._sandbox_input(body)
+            images = extract_input_images(body.input) if self.config.attach_images else []
             if state.task is None:
                 state.activation_request = body.model_copy(deep=True)
-                state.task = asyncio.create_task(self._sandbox_response(state, body, prompt=prompt, system=system))
+                state.task = asyncio.create_task(
+                    self._sandbox_response(state, body, prompt=prompt, system=system, images=images)
+                )
             elif body != state.activation_request:
                 raise HTTPException(409, "Codex sessions support one activation; retry the same request")
             # The invocation belongs to the session; a disconnected waiter cannot cancel it.

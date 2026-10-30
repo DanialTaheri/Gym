@@ -179,6 +179,12 @@ class TestBuildCommand:
         # instruction is the final positional after the `--` separator
         assert cmd[-2:] == ["--", "do the thing"]
 
+    def test_images_precede_the_prompt_separator(self) -> None:
+        agent = _make_agent()
+        cmd = agent._build_command("count", "/work", images=["/work/image_0.png", "/work/image_1.jpg"])
+        assert cmd[-6:] == ["--image", "/work/image_0.png", "--image", "/work/image_1.jpg", "--", "count"]
+        assert "--image" not in agent._build_command("count", "/work")
+
 
 class TestBuildConfig:
     def test_base_config_isolated_and_pinned_to_gym_provider(self) -> None:
