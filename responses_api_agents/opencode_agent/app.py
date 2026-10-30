@@ -637,7 +637,9 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             path.write_bytes(data)
             files.append(str(path.resolve()))
 
-        opencode_args = ["run", "-m", self._effective_model(), "--dir", str(project_dir)]
+        # An explicit title, as in the sandbox path: otherwise OpenCode asks the policy for a session title
+        # under this session's id, a call its own session usage does not count.
+        opencode_args = ["run", "-m", self._effective_model(), "--dir", str(project_dir), "--title", "NeMo Gym"]
         if self.config.thinking:
             opencode_args.append("--thinking")
         opencode_args.extend(self.config.extra_args)
