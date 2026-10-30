@@ -1,0 +1,129 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Visual coding through two more harnesses, Codex and Pi, next to visual_coding_opencode.yaml's OpenCode agent.
+# Load both configs. Each row picks its harness by agent_ref.name:
+#   visual_coding_opencode_agent | visual_coding_codex_agent | visual_coding_pi_agent
+# The judge (visual_coding_opencode resources server) is unchanged: it grades the final \boxed{} answer.
+#
+# Codex and Pi run natively in their own sandbox per episode. A single_agent_turn_legacy environment server per agent
+# seeds the agent session, so the agent creates that sandbox from sandbox_provider (the visual-coding resources
+# server lends none). Task images are written into the sandbox workdir as image_<i>.<ext> and attached to the first
+# model call (Codex --image, Pi @file); the sandbox's python3 is the image toolkit (pillow, numpy, scipy, opencv).
+#
+# Sandbox image: the OpenSandbox snapshot must provide python3 with that toolkit, plus bash, curl, tar, gzip, flock
+# and CA certificates. Codex/Pi install Node 22.19.0 and their CLI into /tmp/nemo-gym-{codex,pi}-node-22.19.0-<ver>
+# on first use (from nodejs.org and registry.npmjs.org) unless that directory already holds the runtime and a
+# `ready` file: bake both runtimes into the snapshot for RL scale.
+#
+# OpenSandbox credentials come from the Gym processes' environment (OPENSANDBOX_DOMAIN, OPENSANDBOX_API_KEY).
+# Keep them out of trainer configs that are printed at startup.
+visual_coding_opensandbox:
+  opensandbox:
+    connection:
+      domain: ${oc.env:OPENSANDBOX_DOMAIN,""}
+      api_key: ${oc.env:OPENSANDBOX_API_KEY,""}
+      protocol: https  # the server's proxy URLs come without a scheme; its load balancer is https-only
+      use_server_proxy: true
+      request_timeout_s: 120
+      keepalive_expiry_s: 3.0
+      max_connections: 1024
+      max_keepalive_connections: 512
+    # As the OpenCode session sandboxes (RL-v2 lt05_osb configs): bounded creates, background commands.
+    create:
+      skip_health_check: true
+      connect_poll_s: 2.0
+      request_timeout_s: 300
+      timeout_s: 900
+      retries: 5
+      retry_delay_s: 5.0
+      retry_max_delay_s: 60.0
+    probe:
+      timeout_s: 30
+      deadline_s: 300
+    operations:
+      retries: 5
+      background_exec: true
+      background_poll_initial_s: 1.0
+      background_poll_interval_s: 10.0
+
+visual_coding_codex_agent:
+  responses_api_agents:
+    codex_agent:
+      entrypoint: app.py
+      # Native sandbox sessions keep their state in one process.
+      num_workers: 1
+      resources_server: null
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      model: policy
+      concurrency: 64
+      codex_version: 0.144.4
+      timeout: 1800
+      # Set to the policy's context window; Codex compacts at most at 90% of it.
+      model_context_window: 131072
+      attach_images: true
+      sandbox_provider: visual_coding_opensandbox
+      sandbox_config:
+        workdir: /workspace
+        ready_timeout_s: 600
+        resources:
+          cpu: 2
+          memory_mib: 8192
+        provider_options:
+          snapshot_id: ???  # OpenSandbox snapshot with the toolkit (and ideally the Codex runtime)
+          resource_requests:  # reserved; resources above are the limits
+            cpu: 0.25
+            memory_mib: 3072
+
+visual_coding_pi_agent:
+  responses_api_agents:
+    pi_agent:
+      entrypoint: app.py
+      num_workers: 1
+      resources_server: null
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      model: policy
+      concurrency: 64
+      pi_version: 0.80.2
+      timeout: 1800
+      context_window: 131072
+      max_output_tokens: 32768
+      attach_images: true
+      vision: true
+      sandbox_provider: visual_coding_opensandbox
+      sandbox_config:
+        workdir: /workspace
+        ready_timeout_s: 600
+        resources:
+          cpu: 2
+          memory_mib: 8192
+        provider_options:
+          snapshot_id: ???  # OpenSandbox snapshot with the toolkit (and ideally the Pi runtime)
+          resource_requests:  # reserved; resources above are the limits
+            cpu: 0.25
+            memory_mib: 3072
+
+visual_coding_codex_environment:
+  environment_servers:
+    single_agent_turn_legacy:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: visual_coding_opencode
+      agent_server:
+        type: responses_api_agents
+        name: visual_coding_codex_agent
+
+visual_coding_pi_environment:
+  environment_servers:
+    single_agent_turn_legacy:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: visual_coding_opencode
+      agent_server:
+        type: responses_api_agents
+        name: visual_coding_pi_agent
